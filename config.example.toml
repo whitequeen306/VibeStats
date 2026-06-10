@@ -1,0 +1,41 @@
+# VibeStats 配置文件
+# VibeCoding Token 消耗统计与趣味看板
+#
+# 内置工具注册表：程序已预置 20+ 常见 AI 编码工具的日志路径和解析规则
+# 你只需在 enabled_tools 中列出要启用的工具 ID 即可
+# 如果工具的默认日志路径不对，可以在 custom_paths 中覆盖
+
+# ============================================================
+# 启用的工具 ID 列表（从内置注册表中选择）
+# 可选值：
+#   AI IDE:       cursor, trae, windsurf
+#   AI CLI:       claude_code, opencoder, aider, codex_cli, goose
+#   VS Code 扩展: github_copilot, cline, roo_code, continue_dev,
+#                 augment, supermaven, cody, tabnine
+#   JetBrains:    copilot_jetbrains, codeium_jetbrains
+#   其他:         amazon_q, warp_ai
+# ============================================================
+enabled_tools = [
+    "cursor",
+    "claude_code",
+    "trae",
+    "windsurf",
+    "github_copilot",
+    "cline",
+]
+
+# 自定义日志路径覆盖（key=工具ID, value=自定义路径）
+# 留空则使用内置默认路径
+# 示例：
+# [custom_paths]
+# cursor = "D:/MyLogs/Cursor/logs"
+# claude_code = "/home/user/custom/claude-logs"
+
+# 定时任务执行时间（24小时制），默认凌晨 00:30
+schedule_time = "00:30"
+
+# 数据库存储路径（相对于数据目录）
+db_path = "vibestats.db"
+
+# HTTP 服务端口
+serve_port = 7890

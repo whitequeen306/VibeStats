@@ -1,0 +1,51 @@
+# Rust
+/target
+**/target/
+Cargo.lock
+
+# Build artifacts
+*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Database (用户数据)
+*.db
+*.sqlite
+*.sqlite3
+
+# Config (包含用户自定义路径)
+config.toml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build logs
+build_err.txt
+build_out.txt
+
+# Exploration scripts
+explore_data*.py
+
+# Release notes (自动生成)
+RELEASE_NOTES.md
+
+# Specstory
+.specstory/
+
+# Logo showcase (开发用)
+logo_showcase.html
+
+# Publish checklist
+PUBLISH_CHECKLIST.md

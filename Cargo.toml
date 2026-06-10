@@ -1,0 +1,31 @@
+[package]
+name = "vibestats"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+notify-rust = "4"
+minijinja = "2"
+actix-web = { version = "4", default-features = false, features = ["macros", "compress-brotli", "compress-gzip", "cookies", "http2", "unicode", "ws"] }
+actix-files = "0.6"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+dirs = "5"
+anyhow = "1"
+regex = "1"
+wry = "0.50"
+tao = "0.32"
+tray-icon = "0.19"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Registry"] }

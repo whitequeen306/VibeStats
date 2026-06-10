@@ -1,0 +1,25 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100" height="100" rx="20" fill="#0B0F1A"/>
+  <g fill="#00E5FF">
+    <!-- Inner ring: 6 dots -->
+    <circle cx="50" cy="35" r="3"/>
+    <circle cx="62.99" cy="42.5" r="3"/>
+    <circle cx="62.99" cy="57.5" r="3"/>
+    <circle cx="50" cy="65" r="3"/>
+    <circle cx="37.01" cy="57.5" r="3"/>
+    <circle cx="37.01" cy="42.5" r="3"/>
+    <!-- Outer ring: 12 dots -->
+    <circle cx="50" cy="25" r="2.5" opacity="0.7"/>
+    <circle cx="62.5" cy="28.35" r="2.5" opacity="0.7"/>
+    <circle cx="71.65" cy="37.5" r="2.5" opacity="0.7"/>
+    <circle cx="75" cy="50" r="2.5" opacity="0.7"/>
+    <circle cx="71.65" cy="62.5" r="2.5" opacity="0.7"/>
+    <circle cx="62.5" cy="71.65" r="2.5" opacity="0.7"/>
+    <circle cx="50" cy="75" r="2.5" opacity="0.7"/>
+    <circle cx="37.5" cy="71.65" r="2.5" opacity="0.7"/>
+    <circle cx="28.35" cy="62.5" r="2.5" opacity="0.7"/>
+    <circle cx="25" cy="50" r="2.5" opacity="0.7"/>
+    <circle cx="28.35" cy="37.5" r="2.5" opacity="0.7"/>
+    <circle cx="37.5" cy="28.35" r="2.5" opacity="0.7"/>
+  </g>
+</svg>
