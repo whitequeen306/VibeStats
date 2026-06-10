@@ -13,7 +13,7 @@
 
 ### 下载即用（推荐）
 
-从 [Releases](https://github.com/yourname/vibestats/releases) 下载对应平台的可执行文件：
+从 [Releases](https://github.com/whitequeen306/VibeStats/releases) 下载对应平台的可执行文件：
 
 - **Windows**: `vibestats.exe`
 - **macOS**: `vibestats`
@@ -31,7 +31,7 @@
 需要 Rust 1.75+。
 
 ```bash
-git clone https://github.com/yourname/vibestats.git
+git clone https://github.com/whitequeen306/VibeStats.git
 cd vibestats
 cargo build --release
 ```
