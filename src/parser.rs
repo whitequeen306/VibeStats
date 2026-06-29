@@ -65,7 +65,9 @@ impl LogParser {
         match &tool_config.log_format {
             LogFormat::CursorSqlite => self.parse_cursor_sqlite(&log_dir, &tool_config.name),
             LogFormat::OpenCodeSqlite => self.parse_opencode_sqlite(&log_dir, &tool_config.name),
+            LogFormat::ZCodeSqlite => self.parse_zcode_sqlite(&log_dir, &tool_config.name),
             LogFormat::TraeCnLog => self.parse_trae_cn_logs(&log_dir, &tool_config.name),
+            LogFormat::CodexJsonl => self.parse_codex_sessions(&log_dir, &tool_config.name),
             LogFormat::TraeCnEncrypted => {
                 info!("Trae CN 数据库已加密，暂不支持解析");
                 vec![]
@@ -740,8 +742,8 @@ impl LogParser {
             .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
             .unwrap_or(0);
 
-        // 对于累计值格式（Claude Code、DeepSeek GUI），必须始终从头读取整个文件，
-        // 因为增量计算需要完整的累计值序列作为上下文
+        // Claude Code（按 message.id 整会话去重）与 DeepSeek GUI（累计值差分）
+        // 都需要从头读取整个文件，故强制从 offset 0 扫描
         let is_cumulative = *log_format == LogFormat::DeepSeekGuiJsonl
             || *log_format == LogFormat::ClaudeCodeJsonl;
 
@@ -771,7 +773,7 @@ impl LogParser {
         let mut events = Vec::new();
         let mut current_pos = start_offset;
 
-        // DeepSeek GUI 和 Claude Code 需要先收集再计算增量
+        // DeepSeek GUI（累计值差分）与 Claude Code（整会话按 message.id 去重）需先收集整文件再处理
         if *log_format == LogFormat::DeepSeekGuiJsonl || *log_format == LogFormat::ClaudeCodeJsonl {
             let mut all_lines = Vec::new();
             loop {
@@ -794,7 +796,7 @@ impl LogParser {
             if *log_format == LogFormat::DeepSeekGuiJsonl {
                 events = Self::parse_deepseek_gui_with_delta(&all_lines, tool_name);
             } else {
-                events = Self::parse_claude_code_with_delta(&all_lines, tool_name);
+                events = Self::parse_claude_code_session(&all_lines, tool_name);
             }
         } else {
             loop {
@@ -831,27 +833,25 @@ impl LogParser {
         match log_format {
             LogFormat::ClaudeCodeJsonl => Self::parse_claude_code(&value, tool_name, line),
             LogFormat::DeepSeekGuiJsonl => Self::parse_deepseek_gui(&value, tool_name, line),
-            LogFormat::CodexJsonl => Self::parse_codex(&value, tool_name, line),
             LogFormat::CopilotJbJsonl => Self::parse_copilot_jb(&value, tool_name, line),
             LogFormat::GenericJsonl => Self::parse_generic(&value, tool_name, line),
             _ => None,
         }
     }
 
-    /// Claude Code 增量计算：同一会话中 usage 是累计值，需要按 message.id 去重后计算差值
-    fn parse_claude_code_with_delta(lines: &[String], tool_name: &str) -> Vec<RawEvent> {
-        // 收集所有 assistant 消息，按 message.id 去重（同一消息可能有多行）
+    /// Claude Code 会话解析：Anthropic 的 message.usage 是"逐请求"计费（非累计），
+    /// 故按 message.id 去重后直接累加每条调用的真实 usage，不再做差分。
+    /// 每条事件保留真实调用时间戳，由存储层按唯一约束去重，避免跨运行重复累加。
+    fn parse_claude_code_session(lines: &[String], tool_name: &str) -> Vec<RawEvent> {
         let mut seen_ids = std::collections::HashSet::new();
-        let mut usages: Vec<(String, String, i64, i64, i64, i64, Option<String>)> = Vec::new();
-        // (message_id, timestamp, input_tokens, output_tokens, cache_read, cache_creation, model)
+        let mut events = Vec::new();
 
         for line in lines {
             let value: Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if msg_type != "assistant" {
+            if value.get("type").and_then(|v| v.as_str()).unwrap_or("") != "assistant" {
                 continue;
             }
             let message = match value.get("message") {
@@ -864,17 +864,19 @@ impl LogParser {
             };
 
             let msg_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if seen_ids.contains(&msg_id) {
-                continue; // 跳过重复的 message.id
+            if !msg_id.is_empty() {
+                if seen_ids.contains(&msg_id) {
+                    continue; // 同一 message.id 可能有多行，仅计一次
+                }
+                seen_ids.insert(msg_id);
             }
-            seen_ids.insert(msg_id.clone());
 
             let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
             let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
             let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
             let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
 
-            // 跳过全零的条目
+            // 跳过没有实际 token 消耗的条目
             if input == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
                 continue;
             }
@@ -884,54 +886,17 @@ impl LogParser {
 
             // cache_creation 是写入缓存的 token（首次写入开销），归入 input 侧成本；
             // cache_read 是缓存命中 token，单独存入 cache_read_tokens
-            usages.push((msg_id, timestamp, input + cache_creation, output, cache_read, cache_creation, model));
-        }
-
-        // 按顺序计算增量：每个消息的增量 = 当前值 - 上一个消息的值
-        // 注意：当累计值减少时（如切换模型、新会话重置），应将当前值视为新的绝对值
-        let mut events = Vec::new();
-        let mut prev_input: i64 = 0;
-        let mut prev_output: i64 = 0;
-        let mut prev_cache: i64 = 0;
-
-        for (i, (_id, timestamp, input, output, cache, _creation, model)) in usages.iter().enumerate() {
-            // 当累计值减少时（计数器重置），将当前值视为绝对值而非增量
-            let delta_input = if i == 0 || *input < prev_input {
-                *input
-            } else {
-                input - prev_input
-            };
-            let delta_output = if i == 0 || *output < prev_output {
-                *output
-            } else {
-                output - prev_output
-            };
-            let delta_cache = if i == 0 || *cache < prev_cache {
-                *cache
-            } else {
-                cache - prev_cache
-            };
-
-            // 跳过增量为 0 的条目
-            if delta_input == 0 && delta_output == 0 && delta_cache == 0 && i > 0 {
-                continue;
-            }
-
             events.push(RawEvent {
                 id: None,
                 tool_name: tool_name.to_string(),
-                timestamp: timestamp.clone(),
-                input_tokens: delta_input,
-                output_tokens: delta_output,
-                cache_read_tokens: delta_cache,
-                model_name: model.clone(),
+                timestamp,
+                input_tokens: input + cache_creation,
+                output_tokens: output,
+                cache_read_tokens: cache_read,
+                model_name: model,
                 actual_cost: None,
-                raw_line: Some(format!("sessionId deduplicated")),
+                raw_line: Some("claude_code per-call usage".to_string()),
             });
-
-            prev_input = *input;
-            prev_output = *output;
-            prev_cache = *cache;
         }
 
         events
@@ -1107,30 +1072,6 @@ impl LogParser {
         })
     }
 
-    /// Codex sessions rollout JSONL 解析（无 token 数据，仅记录会话事件）
-    fn parse_codex(value: &Value, tool_name: &str, raw: &str) -> Option<RawEvent> {
-        let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if msg_type != "event_msg" {
-            return None;
-        }
-        let payload_type = value.get("payload")?.get("type")?.as_str()?.to_string();
-        if payload_type != "task_complete" {
-            return None;
-        }
-
-        Some(RawEvent {
-            id: None,
-            tool_name: tool_name.to_string(),
-            timestamp: value.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            model_name: None,
-            actual_cost: None,
-            raw_line: Some(raw.to_string()),
-        })
-    }
-
     /// Copilot JetBrains partition JSONL 解析（无 token 数据）
     fn parse_copilot_jb(value: &Value, tool_name: &str, raw: &str) -> Option<RawEvent> {
         let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1164,6 +1105,136 @@ impl LogParser {
             actual_cost: None,
             raw_line: Some(raw.to_string()),
         })
+    }
+
+    /// Codex sessions rollout JSONL 解析（快照式）。
+    /// 每个 session 文件中 token_count 事件的 `total_token_usage` 是会话累计值（单调递增，
+    /// 即使 compacted 也不重置）；而 `last_token_usage` 逐事件求和会过计（1.1~1.27 倍）。
+    /// 故按"每日末次累计值做差"得到当日真实用量：delta(d1)=cum(d1), delta(dk)=cum(dk)-cum(d_{k-1})，
+    /// 各日增量之和恰等于会话最终累计值。按 (date, model) 聚合，时间戳取日期精度
+    /// `YYYY-MM-DDT00:00:00`，由存储层按 (tool, date) 替换写入，避免跨运行重复累加。
+    fn parse_codex_sessions(&self, dir: &Path, tool_name: &str) -> Vec<RawEvent> {
+        use std::collections::BTreeMap;
+        let files = self.find_jsonl_files(dir);
+        // (date, model) -> (input, cached, output, reasoning)
+        let mut agg: BTreeMap<(String, String), (i64, i64, i64, i64)> = BTreeMap::new();
+
+        for file_path in &files {
+            // date -> (input, cached, output, reasoning, model)，取当日末次（最大）累计值
+            let mut per_day: BTreeMap<String, (i64, i64, i64, i64, Option<String>)> = BTreeMap::new();
+            let mut last_model: Option<String> = None;
+
+            let file = match OpenOptions::new().read(true).open(file_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!("无法打开 codex 会话文件 {}: {}", file_path.display(), e);
+                    continue;
+                }
+            };
+            for line in BufReader::new(file).lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                // turn_context 携带 payload.model，记录最近一次模型（按文件顺序，即时间顺序）
+                if value.get("type").and_then(|v| v.as_str()) == Some("turn_context") {
+                    if let Some(m) = value
+                        .get("payload")
+                        .and_then(|p| p.get("model"))
+                        .and_then(|v| v.as_str())
+                    {
+                        last_model = Some(m.to_string());
+                    }
+                    continue;
+                }
+
+                if value.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+                    continue;
+                }
+                let payload = match value.get("payload") {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if payload.get("type").and_then(|v| v.as_str()) != Some("token_count") {
+                    continue;
+                }
+                let tt = match payload.get("info").and_then(|i| i.get("total_token_usage")) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let input = tt.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let cached = tt.get("cached_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let output = tt.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let reason = tt.get("reasoning_output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                // 日期取 token_count 事件时间戳前 10 位（UTC 日期）
+                let ts = value.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                let day = match ts.get(..10) {
+                    Some(d) => d.to_string(),
+                    None => continue,
+                };
+
+                // 累计值单调递增，取当日末次（最大）值；更新时同步记录当日模型
+                let entry = per_day.entry(day).or_insert((0, 0, 0, 0, None));
+                let mut updated = false;
+                if input > entry.0 { entry.0 = input; updated = true; }
+                if cached > entry.1 { entry.1 = cached; updated = true; }
+                if output > entry.2 { entry.2 = output; updated = true; }
+                if reason > entry.3 { entry.3 = reason; updated = true; }
+                if updated {
+                    entry.4 = last_model.clone();
+                }
+            }
+
+            // 按日做差得到当日增量，累加到 (date, model) 聚合
+            let mut prev: (i64, i64, i64, i64) = (0, 0, 0, 0);
+            for (day, cur) in per_day.into_iter() {
+                let delta = (
+                    (cur.0 - prev.0).max(0),
+                    (cur.1 - prev.1).max(0),
+                    (cur.2 - prev.2).max(0),
+                    (cur.3 - prev.3).max(0),
+                );
+                let model = cur.4.unwrap_or_default();
+                let e = agg.entry((day, model)).or_insert((0, 0, 0, 0));
+                e.0 += delta.0;
+                e.1 += delta.1;
+                e.2 += delta.2;
+                e.3 += delta.3;
+                prev = (cur.0, cur.1, cur.2, cur.3);
+            }
+        }
+
+        // 生成 RawEvent：每 (date, model) 一条，时间戳日期精度
+        let mut events = Vec::new();
+        for ((day, model), (input, cached, output, reason)) in agg.into_iter() {
+            if input == 0 && cached == 0 && output == 0 && reason == 0 {
+                continue;
+            }
+            events.push(RawEvent {
+                id: None,
+                tool_name: tool_name.to_string(),
+                timestamp: format!("{}T00:00:00", day),
+                input_tokens: input,
+                output_tokens: output + reason, // reasoning 属于生成输出
+                cache_read_tokens: cached,
+                model_name: if model.is_empty() { None } else { Some(model) },
+                actual_cost: None,
+                raw_line: Some("codex cumulative-delta by day".to_string()),
+            });
+        }
+        info!("从 Codex sessions 解析到 {} 条日聚合事件", events.len());
+        events
     }
 
     /// 递归查找目录下所有 .jsonl 文件
@@ -1367,6 +1438,108 @@ impl LogParser {
             .and_then(|id| id.as_str())
             .map(|s| s.to_string())
     }
+
+    /// ZCode SQLite 数据库解析（model_usage 表含精确 token/cache 数据）
+    /// 数据源：~/.zcode/cli/db/db.sqlite 的 model_usage 表
+    /// 每行一条模型调用记录，已带 model_id，按 (日期, 模型) 聚合
+    fn parse_zcode_sqlite(&self, log_dir: &Path, tool_name: &str) -> Vec<RawEvent> {
+        let db_path = log_dir.join("db.sqlite");
+        if !db_path.exists() {
+            info!("ZCode 数据库不存在: {}", db_path.display());
+            return vec![];
+        }
+
+        // 只读打开，避免与运行中的 ZCode 抢锁
+        let conn = match rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                info!("无法打开 ZCode 数据库: {}", e);
+                return vec![];
+            }
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, \
+                cache_creation_input_tokens, cache_read_input_tokens \
+             FROM model_usage \
+             WHERE (input_tokens > 0 OR output_tokens > 0) AND model_id IS NOT NULL \
+             ORDER BY completed_at"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                info!("ZCode model_usage 表查询失败: {}", e);
+                return vec![];
+            }
+        };
+
+        // 按日期+模型聚合：(input, output, cache_read, count)
+        // input_tokens 含 cache_creation（写入缓存开销归 input 侧，与 OpenCode 约定一致）
+        // output_tokens 含 reasoning（推理 token 按 output 价计费，无独立字段）
+        let mut daily: HashMap<(String, String), (i64, i64, i64, i64)> = HashMap::new();
+
+        let rows_result = stmt.query_map(
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0).unwrap_or(0),              // completed_at (ms)
+                    row.get::<_, Option<String>>(1).ok().flatten(), // model_id
+                    row.get::<_, i64>(2).unwrap_or(0),              // input_tokens
+                    row.get::<_, i64>(3).unwrap_or(0),              // output_tokens
+                    row.get::<_, i64>(4).unwrap_or(0),              // reasoning_tokens
+                    row.get::<_, i64>(5).unwrap_or(0),              // cache_creation_input_tokens
+                    row.get::<_, i64>(6).unwrap_or(0),              // cache_read_input_tokens
+                ))
+            },
+        );
+
+        let rows: Vec<(i64, Option<String>, i64, i64, i64, i64, i64)> = match rows_result {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        };
+
+        for (completed_at, model_raw, inp, out, reason, cache_write, cache_read) in &rows {
+            let ts_secs = *completed_at / 1000;
+            let dt = match chrono::DateTime::from_timestamp(ts_secs, 0) {
+                Some(d) => d.format("%Y-%m-%d").to_string(),
+                None => continue,
+            };
+            // 归一化模型名（大小写不统一：glm-5.2 / GLM-5.2 / GLM-5-Turbo）
+            let model = model_raw
+                .as_ref()
+                .map(|m| m.to_lowercase())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let entry = daily.entry((dt, model)).or_insert((0, 0, 0, 0));
+            entry.0 += *inp + *cache_write; // cache_creation 归入 input 侧
+            entry.1 += *out + *reason;      // reasoning 归入 output 侧
+            entry.2 += *cache_read;         // 缓存命中单独统计
+            entry.3 += 1;
+        }
+
+        let mut events = Vec::new();
+        for ((date, model), (input, output, cache_read, count)) in &daily {
+            if *input == 0 && *output == 0 {
+                continue;
+            }
+            events.push(RawEvent {
+                id: None,
+                tool_name: tool_name.to_string(),
+                timestamp: format!("{}T00:00:00", date),
+                input_tokens: *input,
+                output_tokens: *output,
+                cache_read_tokens: *cache_read,
+                model_name: Some(model.clone()),
+                actual_cost: None, // ZCode 无费用字段，由 estimate_cost 按 GLM-5 定价估算
+                raw_line: Some(format!("ZCode: {} records (model={})", count, model)),
+            });
+        }
+
+        info!("ZCode: {} 天×模型, {} 条事件", daily.len(), events.len());
+        events
+    }
 }
 
 #[cfg(test)]
@@ -1403,7 +1576,7 @@ mod tests {
         let jsonl_content = r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":300},"model":"claude-sonnet-4-20250514"},"timestamp":"2026-06-09T10:00:00"}"#;
 
         let lines: Vec<String> = vec![jsonl_content.to_string()];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
         assert_eq!(events.len(), 1, "应解析出 1 条事件");
         let event = &events[0];
@@ -1428,7 +1601,7 @@ mod tests {
         let lines: Vec<String> = vec![
             r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":500},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
         ];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1441,47 +1614,47 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_code_delta_calculation() {
-        // 测试增量计算：同一会话中 usage 是累计值
+    fn test_claude_code_per_call_usage() {
+        // Anthropic usage 是逐请求计费（非累计），每条 assistant 消息直接记录其真实 usage
         let lines: Vec<String> = vec![
             r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":200},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
             r#"{"type":"assistant","message":{"id":"msg_002","usage":{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":100,"cache_creation_input_tokens":300},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:01:00"}"#.to_string(),
         ];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
-        assert_eq!(events.len(), 2, "应解析出 2 条增量事件");
+        assert_eq!(events.len(), 2, "应解析出 2 条逐调用事件");
 
-        // 第 1 条：绝对值
-        // input = 100 + 200(cache_creation) = 300, output = 50, cache_read = 0
-        assert_eq!(events[0].input_tokens, 300, "第 1 条 input 增量应为 300");
-        assert_eq!(events[0].output_tokens, 50, "第 1 条 output 增量应为 50");
-        assert_eq!(events[0].cache_read_tokens, 0, "第 1 条 cache_read 增量应为 0");
+        // 第 1 条：input = 100 + 200(cache_creation) = 300, output = 50, cache_read = 0
+        assert_eq!(events[0].input_tokens, 300, "第 1 条 input 应为 300");
+        assert_eq!(events[0].output_tokens, 50, "第 1 条 output 应为 50");
+        assert_eq!(events[0].cache_read_tokens, 0, "第 1 条 cache_read 应为 0");
 
-        // 第 2 条：增量
-        // input = (200+300) - (100+200) = 200, output = 100-50 = 50, cache_read = 100-0 = 100
-        assert_eq!(events[1].input_tokens, 200, "第 2 条 input 增量应为 200");
-        assert_eq!(events[1].output_tokens, 50, "第 2 条 output 增量应为 50");
-        assert_eq!(events[1].cache_read_tokens, 100, "第 2 条 cache_read 增量应为 100");
+        // 第 2 条：input = 200 + 300(cache_creation) = 500, output = 100, cache_read = 100
+        assert_eq!(events[1].input_tokens, 500, "第 2 条 input 应为 500");
+        assert_eq!(events[1].output_tokens, 100, "第 2 条 output 应为 100");
+        assert_eq!(events[1].cache_read_tokens, 100, "第 2 条 cache_read 应为 100");
     }
 
     #[test]
-    fn test_claude_code_counter_reset() {
-        // 测试累计值减少（计数器重置）时的处理
+    fn test_claude_code_per_call_independent() {
+        // 每条调用的 usage 独立，不做差分；即使后一条数值更小也直接记录
         let lines: Vec<String> = vec![
             r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":500,"output_tokens":200,"cache_read_input_tokens":100,"cache_creation_input_tokens":0},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
             r#"{"type":"assistant","message":{"id":"msg_002","usage":{"input_tokens":50,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":0},"model":"claude-sonnet"},"timestamp":"2026-06-09T11:00:00"}"#.to_string(),
         ];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
         assert_eq!(events.len(), 2);
 
-        // 第 2 条：累计值减少，应视为绝对值而非增量
-        assert_eq!(events[1].input_tokens, 50,
-            "累计值减少时，input 应视为绝对值 50");
-        assert_eq!(events[1].output_tokens, 20,
-            "累计值减少时，output 应视为绝对值 20");
-        assert_eq!(events[1].cache_read_tokens, 10,
-            "累计值减少时，cache_read 应视为绝对值 10");
+        // 第 1 条：直接记录 500/200/100
+        assert_eq!(events[0].input_tokens, 500, "第 1 条 input 应为 500");
+        assert_eq!(events[0].output_tokens, 200, "第 1 条 output 应为 200");
+        assert_eq!(events[0].cache_read_tokens, 100, "第 1 条 cache_read 应为 100");
+
+        // 第 2 条：直接记录 50/20/10（不与前一条做差）
+        assert_eq!(events[1].input_tokens, 50, "第 2 条 input 应为 50");
+        assert_eq!(events[1].output_tokens, 20, "第 2 条 output 应为 20");
+        assert_eq!(events[1].cache_read_tokens, 10, "第 2 条 cache_read 应为 10");
     }
 
     #[test]
@@ -1491,7 +1664,7 @@ mod tests {
             r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
             r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
         ];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
         assert_eq!(events.len(), 1, "相同 message.id 应去重，只保留 1 条");
     }
@@ -1503,7 +1676,7 @@ mod tests {
             r#"{"type":"human","message":{"content":"hello"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
             r#"{"type":"assistant","message":{"id":"msg_001","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:01:00"}"#.to_string(),
         ];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
         assert_eq!(events.len(), 1, "只有 assistant 类型应被解析");
     }
@@ -1514,7 +1687,7 @@ mod tests {
         let lines: Vec<String> = vec![
             r#"{"type":"assistant","message":{"id":"msg_000","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"model":"claude-sonnet"},"timestamp":"2026-06-09T10:00:00"}"#.to_string(),
         ];
-        let events = LogParser::parse_claude_code_with_delta(&lines, "claude_code");
+        let events = LogParser::parse_claude_code_session(&lines, "claude_code");
 
         assert_eq!(events.len(), 0, "全零 usage 应被跳过");
     }
@@ -1690,6 +1863,198 @@ mod tests {
     }
 
     // ============================================================
+    // ZCode SQLite 解析测试
+    // ============================================================
+
+    #[test]
+    fn test_zcode_cache_write_goes_to_input() {
+        // 核心测试：cache_creation_input_tokens 应归入 input_tokens
+        let dir = create_temp_data_dir();
+        let db_path = dir.path().join("db.sqlite");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage (
+                id INTEGER PRIMARY KEY,
+                completed_at INTEGER,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER
+            );
+            INSERT INTO model_usage (completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+            VALUES (1782416586082, 'glm-5.2', 1000, 500, 0, 300, 200);
+            "
+        ).unwrap();
+        drop(conn);
+
+        let parser = LogParser::new(dir.path());
+        let events = parser.parse_zcode_sqlite(dir.path(), "zcode");
+
+        assert!(!events.is_empty(), "应解析出事件");
+
+        // input_tokens 应为 input(1000) + cache_creation(300) = 1300
+        let total_input: i64 = events.iter().map(|e| e.input_tokens).sum();
+        let total_output: i64 = events.iter().map(|e| e.output_tokens).sum();
+        let total_cache_read: i64 = events.iter().map(|e| e.cache_read_tokens).sum();
+
+        assert_eq!(total_input, 1300,
+            "input_tokens 应为 input(1000) + cache_creation(300) = 1300, 实际 {}", total_input);
+        assert_eq!(total_output, 500,
+            "output_tokens 应为 500, 实际 {}", total_output);
+        assert_eq!(total_cache_read, 200,
+            "cache_read_tokens 应为 200, 实际 {}", total_cache_read);
+    }
+
+    #[test]
+    fn test_zcode_reasoning_goes_to_output() {
+        // reasoning_tokens 应归入 output_tokens（按 output 价计费）
+        let dir = create_temp_data_dir();
+        let db_path = dir.path().join("db.sqlite");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage (
+                id INTEGER PRIMARY KEY,
+                completed_at INTEGER,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER
+            );
+            INSERT INTO model_usage (completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+            VALUES (1782416586082, 'glm-5.2', 500, 200, 800, 0, 0);
+            "
+        ).unwrap();
+        drop(conn);
+
+        let parser = LogParser::new(dir.path());
+        let events = parser.parse_zcode_sqlite(dir.path(), "zcode");
+
+        assert!(!events.is_empty());
+
+        // output_tokens 应为 output(200) + reasoning(800) = 1000
+        let total_output: i64 = events.iter().map(|e| e.output_tokens).sum();
+        assert_eq!(total_output, 1000,
+            "output_tokens 应为 output(200) + reasoning(800) = 1000, 实际 {}", total_output);
+
+        let total_input: i64 = events.iter().map(|e| e.input_tokens).sum();
+        assert_eq!(total_input, 500, "input_tokens 应为 500, 实际 {}", total_input);
+    }
+
+    #[test]
+    fn test_zcode_model_normalization() {
+        // 同日大小写不同的模型名应归一化并聚合
+        let dir = create_temp_data_dir();
+        let db_path = dir.path().join("db.sqlite");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage (
+                id INTEGER PRIMARY KEY,
+                completed_at INTEGER,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER
+            );
+            INSERT INTO model_usage (completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+            VALUES (1782416586082, 'GLM-5.2', 100, 50, 0, 0, 0);
+            INSERT INTO model_usage (completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+            VALUES (1782416686082, 'glm-5.2', 200, 100, 0, 0, 0);
+            "
+        ).unwrap();
+        drop(conn);
+
+        let parser = LogParser::new(dir.path());
+        let events = parser.parse_zcode_sqlite(dir.path(), "zcode");
+
+        assert!(!events.is_empty());
+        // GLM-5.2 与 glm-5.2 同日应归一化聚合为一条
+        assert_eq!(events.len(), 1, "同日同模型(大小写不同)应聚合为一条事件");
+        let total_input: i64 = events.iter().map(|e| e.input_tokens).sum();
+        assert_eq!(total_input, 300, "聚合 input 应为 300, 实际 {}", total_input);
+        assert_eq!(events[0].model_name.as_deref(), Some("glm-5.2"),
+            "模型名应归一化为小写 glm-5.2");
+    }
+
+    #[test]
+    fn test_zcode_multiple_records_aggregation() {
+        // 同日同模型多条记录应聚合
+        let dir = create_temp_data_dir();
+        let db_path = dir.path().join("db.sqlite");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage (
+                id INTEGER PRIMARY KEY,
+                completed_at INTEGER,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER
+            );
+            INSERT INTO model_usage (completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+            VALUES (1782416586082, 'glm-5.2', 100, 50, 10, 10, 20);
+            INSERT INTO model_usage (completed_at, model_id, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+            VALUES (1782416686082, 'glm-5.2', 200, 100, 20, 20, 40);
+            "
+        ).unwrap();
+        drop(conn);
+
+        let parser = LogParser::new(dir.path());
+        let events = parser.parse_zcode_sqlite(dir.path(), "zcode");
+
+        assert!(!events.is_empty());
+        assert_eq!(events.len(), 1, "同日同模型应聚合为一条");
+
+        let total_input: i64 = events.iter().map(|e| e.input_tokens).sum();
+        let total_output: i64 = events.iter().map(|e| e.output_tokens).sum();
+        let total_cache_read: i64 = events.iter().map(|e| e.cache_read_tokens).sum();
+
+        // input = (100+10) + (200+20) = 330
+        assert_eq!(total_input, 330, "聚合 input 应为 330, 实际 {}", total_input);
+        // output = (50+10) + (100+20) = 180
+        assert_eq!(total_output, 180, "聚合 output 应为 180, 实际 {}", total_output);
+        assert_eq!(total_cache_read, 60, "聚合 cache_read 应为 60, 实际 {}", total_cache_read);
+    }
+
+    #[test]
+    fn test_zcode_empty_db() {
+        // 空数据库应返回空结果
+        let dir = create_temp_data_dir();
+        let db_path = dir.path().join("db.sqlite");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_usage (
+                id INTEGER PRIMARY KEY,
+                completed_at INTEGER,
+                model_id TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER
+            );"
+        ).unwrap();
+        drop(conn);
+
+        let parser = LogParser::new(dir.path());
+        let events = parser.parse_zcode_sqlite(dir.path(), "zcode");
+
+        assert!(events.is_empty(), "空数据库应返回空结果");
+    }
+
+    // ============================================================
     // DeepSeek GUI 解析测试
     // ============================================================
 
@@ -1811,28 +2176,56 @@ mod tests {
     }
 
     // ============================================================
-    // Codex 解析测试
+    // Codex sessions 解析测试（累计值按日做差）
     // ============================================================
 
     #[test]
-    fn test_codex_parsing() {
-        let value: serde_json::Value = serde_json::from_str(
-            r#"{"type":"event_msg","payload":{"type":"task_complete"},"timestamp":"2026-06-09T10:00:00"}"#
-        ).unwrap();
-        let event = LogParser::parse_codex(&value, "codex", "test");
-        assert!(event.is_some(), "task_complete 事件应被解析");
-        let e = event.unwrap();
-        assert_eq!(e.input_tokens, 0, "Codex 无 token 数据");
-        assert_eq!(e.output_tokens, 0, "Codex 无 token 数据");
+    fn test_codex_sessions_cumulative_delta_by_day() {
+        // total_token_usage 是会话累计值（单调递增）；按"每日末次累计值做差"得到当日用量
+        let dir = create_temp_data_dir();
+        let lines = [
+            // turn_context 提供 model
+            r#"{"timestamp":"2026-06-09T10:00:00.000Z","type":"turn_context","payload":{"model":"glm-5.2","turn_id":"t1"}}"#,
+            // Day1: 累计值增长 100→200
+            r#"{"timestamp":"2026-06-09T10:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110},"last_token_usage":{}}}}"#,
+            r#"{"timestamp":"2026-06-09T11:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":0,"total_tokens":270},"last_token_usage":{}}}}"#,
+            // Day2: 累计值增长到 500
+            r#"{"timestamp":"2026-06-10T10:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":40,"reasoning_output_tokens":0,"total_tokens":640},"last_token_usage":{}}}}"#,
+        ];
+        create_temp_jsonl(dir.path(), "rollout-test.jsonl", &lines);
+
+        let mut parser = LogParser::new(dir.path());
+        let events = parser.parse_codex_sessions(dir.path(), "codex");
+
+        // 2 天 → 2 条日聚合事件
+        assert_eq!(events.len(), 2, "应解析出 2 条日聚合事件，实际 {}", events.len());
+
+        // 按日期升序（BTreeMap）
+        assert_eq!(events[0].timestamp, "2026-06-09T00:00:00");
+        assert_eq!(events[0].input_tokens, 200, "Day1 input = 末次累计 200 - 0");
+        assert_eq!(events[0].cache_read_tokens, 50, "Day1 cache = 50 - 0");
+        assert_eq!(events[0].output_tokens, 20, "Day1 output = 20 - 0");
+        assert_eq!(events[0].model_name.as_deref(), Some("glm-5.2"));
+
+        assert_eq!(events[1].timestamp, "2026-06-10T00:00:00");
+        assert_eq!(events[1].input_tokens, 300, "Day2 input = 500 - 200");
+        assert_eq!(events[1].cache_read_tokens, 50, "Day2 cache = 100 - 50");
+        assert_eq!(events[1].output_tokens, 20, "Day2 output = 40 - 20");
     }
 
     #[test]
-    fn test_codex_skip_non_task_complete() {
-        let value: serde_json::Value = serde_json::from_str(
-            r#"{"type":"event_msg","payload":{"type":"task_start"},"timestamp":"2026-06-09T10:00:00"}"#
-        ).unwrap();
-        let event = LogParser::parse_codex(&value, "codex", "test");
-        assert!(event.is_none(), "非 task_complete 事件应被跳过");
+    fn test_codex_sessions_skips_files_without_token_data() {
+        // 无 token_count 事件的会话文件应被跳过
+        let dir = create_temp_data_dir();
+        let lines = [
+            r#"{"timestamp":"2026-06-09T10:00:00.000Z","type":"session_meta","payload":{"id":"s1"}}"#,
+            r#"{"timestamp":"2026-06-09T10:00:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        ];
+        create_temp_jsonl(dir.path(), "rollout-empty.jsonl", &lines);
+
+        let mut parser = LogParser::new(dir.path());
+        let events = parser.parse_codex_sessions(dir.path(), "codex");
+        assert!(events.is_empty(), "无 token 数据的文件不应产生事件");
     }
 
     // ============================================================

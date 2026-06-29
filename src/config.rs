@@ -30,7 +30,7 @@ pub enum LogFormat {
     DeepSeekGuiJsonl,
     /// Cursor AI Tracking SQLite 数据库
     CursorSqlite,
-    /// Codex sessions rollout JSONL（无 token 数据，仅会话记录）
+    /// Codex sessions rollout JSONL（按会话累计 token_usage，取每会话最后累计值按天聚合）
     CodexJsonl,
     /// Copilot JetBrains partition JSONL（无 token 数据，仅对话记录）
     CopilotJbJsonl,
@@ -44,6 +44,23 @@ pub enum LogFormat {
     GenericJsonl,
     /// OpenCode SQLite 数据库（session 表含精确 token 数据）
     OpenCodeSqlite,
+    /// ZCode SQLite 数据库（model_usage 表含精确 token 与缓存数据）
+    ZCodeSqlite,
+}
+
+/// 判断该日志格式是否为"快照式"解析器。
+/// 快照式解析器每次运行重读整个数据源、按天聚合并产出日期精度时间戳
+/// （`YYYY-MM-DDT00:00:00`），其累计值会随解析增长——必须按 (tool, date) 替换写入，
+/// 否则每次采集都会重复累加。增量式解析器则用真实调用时间戳 + 唯一约束去重插入。
+pub fn is_snapshot_format(fmt: &LogFormat) -> bool {
+    matches!(
+        fmt,
+        LogFormat::ZCodeSqlite
+            | LogFormat::OpenCodeSqlite
+            | LogFormat::TraeCnLog
+            | LogFormat::CursorSqlite
+            | LogFormat::CodexJsonl
+    )
 }
 
 /// 全局内置工具注册表
@@ -204,6 +221,16 @@ pub fn builtin_tools() -> &'static [BuiltinTool] {
             linux_path: ".local/share/opencode",
             has_token_data: true,
         },
+        BuiltinTool {
+            id: "zcode",
+            display_name: "ZCode",
+            description: "ZCode AI 编程助手（本地 SQLite 含精确 Token 与缓存数据）",
+            log_format: LogFormat::ZCodeSqlite,
+            windows_path: ".zcode/cli/db",
+            macos_path: ".zcode/cli/db",
+            linux_path: ".zcode/cli/db",
+            has_token_data: true,
+        },
     ]
 }
 
@@ -241,6 +268,10 @@ pub fn get_default_log_path(tool_id: &str) -> Option<PathBuf> {
 // 用户配置结构
 // ============================================================
 
+fn default_exchange_rate() -> f64 {
+    7.2
+}
+
 /// VibeStats 全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -254,6 +285,12 @@ pub struct Config {
     pub db_path: String,
     /// HTTP 服务端口
     pub serve_port: u16,
+    /// 模型定价覆盖（key=模型名小写, value=每百万 Token 美元价），覆盖内置硬编码定价
+    #[serde(default)]
+    pub pricing_overrides: std::collections::HashMap<String, crate::models::ModelPricing>,
+    /// 美元→人民币汇率（1 USD = ? CNY），可在设置页修改并触发历史费用重算
+    #[serde(default = "default_exchange_rate")]
+    pub exchange_rate: f64,
 }
 
 impl Default for Config {
@@ -267,11 +304,14 @@ impl Default for Config {
                 "codex".into(),
                 "copilot_jb".into(),
                 "opencode".into(),
+                "zcode".into(),
             ],
             custom_paths: std::collections::HashMap::new(),
             schedule_time: "00:30".into(),
             db_path: "vibestats.db".into(),
             serve_port: 7890,
+            pricing_overrides: std::collections::HashMap::new(),
+            exchange_rate: 7.2,
         }
     }
 }
@@ -285,7 +325,20 @@ impl Config {
 
     pub fn save_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        // 原子写：先写同目录临时文件再 rename 替换，避免写一半崩溃导致 config.toml 损坏
+        // （损坏会被 load_config 静默重置为 Default，丢失全部设置）
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("config")
+        ));
+        if let Err(e) = std::fs::write(&tmp_path, &content) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(anyhow::anyhow!("写临时配置失败: {}", e));
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(anyhow::anyhow!("替换配置文件失败: {}", e));
+        }
         Ok(())
     }
 
@@ -407,6 +460,7 @@ mod tests {
         assert!(ids.contains(&"cursor"), "应包含 cursor");
         assert!(ids.contains(&"trae_cn"), "应包含 trae_cn");
         assert!(ids.contains(&"opencode"), "应包含 opencode");
+        assert!(ids.contains(&"zcode"), "应包含 zcode");
         assert!(ids.contains(&"codex"), "应包含 codex");
     }
 
@@ -432,6 +486,7 @@ mod tests {
         assert!(config.enabled_tools.contains(&"deepseek_gui".to_string()));
         assert!(config.enabled_tools.contains(&"cursor".to_string()));
         assert!(config.enabled_tools.contains(&"opencode".to_string()));
+        assert!(config.enabled_tools.contains(&"zcode".to_string()));
         assert_eq!(config.serve_port, 7890);
     }
 
@@ -518,7 +573,7 @@ mod tests {
     fn test_cache_supporting_tools_have_token_data() {
         // 验证有缓存数据的工具标记正确
         let tools = builtin_tools();
-        let cache_tools = ["claude_code", "deepseek_gui", "opencode"];
+        let cache_tools = ["claude_code", "deepseek_gui", "opencode", "zcode"];
 
         for id in &cache_tools {
             let tool = tools.iter().find(|t| t.id == *id).unwrap();
