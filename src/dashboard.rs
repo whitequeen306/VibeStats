@@ -5,7 +5,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use log::info;
 
 use crate::config::Config;
-use crate::models::{AggregatedStats, CacheStatsResponse, CacheToolStats, CacheTotals, TrendResponse, ToolTrendSeries, TrendPointValue};
+use crate::models::{AggregatedStats, CacheStatsResponse, CacheToolStats, CacheTotals, ModelPricing, TrendResponse, ToolTrendSeries, TrendPointValue};
 use crate::storage::Storage;
 
 const TOOL_COLORS: &[(&str, &str)] = &[
@@ -43,7 +43,7 @@ impl Dashboard {
         info!("启动 Web Dashboard，地址: http://localhost:{}", port);
 
         let storage_data = web::Data::new(std::sync::Mutex::new(storage));
-        let config_data = web::Data::new(config.clone());
+        let config_data = web::Data::new(std::sync::RwLock::new(config.clone()));
         let data_dir_clone = data_dir.clone();
 
         HttpServer::new(move || {
@@ -57,7 +57,13 @@ impl Dashboard {
                 .route("/api/builtin-tools", web::get().to(get_builtin_tools))
                 .route("/api/dates", web::get().to(get_dates))
                 .route("/api/cache-stats", web::get().to(get_cache_stats))
-                .route("/", web::get().to(index))
+                .route("/api/pricing", web::get().to(get_pricing))
+                .route("/api/pricing", web::put().to(update_pricing))
+        .route("/pricing", web::get().to(pricing_page))
+        .route("/settings", web::get().to(settings_page))
+        .route("/api/settings", web::get().to(get_settings))
+        .route("/api/settings", web::put().to(update_settings))
+        .route("/", web::get().to(index))
                 .service(fs::Files::new("/static", data_dir_clone.join("static")).show_files_listing())
         })
         .bind(format!("127.0.0.1:{}", port))?
@@ -182,9 +188,180 @@ async fn get_tools(storage: web::Data<std::sync::Mutex<Storage>>) -> HttpRespons
     }
 }
 
-async fn get_builtin_tools(config: web::Data<Config>) -> HttpResponse {
+async fn get_builtin_tools(config: web::Data<std::sync::RwLock<Config>>) -> HttpResponse {
+    let config = config.read().unwrap();
     let status = config.all_tools_status();
     HttpResponse::Ok().json(status)
+}
+
+// 模型定价：返回当前生效价（覆盖优先，否则内置硬编码），覆盖所有 DB 出现过的模型 + 已有覆盖项
+async fn get_pricing(
+    config: web::Data<std::sync::RwLock<Config>>,
+    storage: web::Data<std::sync::Mutex<Storage>>,
+) -> HttpResponse {
+    let mut map = config.read().unwrap().pricing_overrides.clone();
+    let models = storage.lock().unwrap().get_distinct_models().unwrap_or_default();
+    for model in models {
+        // 统一小写为 key，避免同一模型大小写不同出现两行
+        let key = model.to_lowercase();
+        map.entry(key).or_insert_with(|| crate::models::get_model_pricing(&model));
+    }
+    // 兜底定价也作为可编辑行：覆盖 model_name 为空（未识别）的事件
+    map.entry("default".to_string())
+        .or_insert_with(|| crate::models::get_model_pricing("default"));
+    // 返回 {rate, currency, symbol, models}：定价编辑器按 rate 把 USD 存储价换算为 ¥ 展示
+    HttpResponse::Ok().json(serde_json::json!({
+        "rate": crate::models::get_usd_to_rmb(),
+        "currency": "CNY",
+        "symbol": "¥",
+        "models": map,
+    }))
+}
+
+// 模型定价：整体替换 pricing_overrides，更新全局表 + 按新价重算 + 落盘
+// 顺序原则：先设全局表→重算→成功才落盘；重算失败则回滚全局表，避免磁盘/历史费用不一致
+async fn update_pricing(
+    config: web::Data<std::sync::RwLock<Config>>,
+    storage: web::Data<std::sync::Mutex<Storage>>,
+    body: web::Json<std::collections::HashMap<String, ModelPricing>>,
+) -> HttpResponse {
+    let new_map = body.into_inner();
+    // 旧值用于重算失败时回滚全局表（config_data 与全局表启动时同源、且仅此处同步更新）
+    let old_map = config.read().unwrap().pricing_overrides.clone();
+    // 1) 先更新进程全局覆盖表，recompute 通过 get_model_pricing 读取此表用新价
+    crate::models::set_pricing_overrides(new_map.clone());
+    // 2) 用新定价重算所有有原始事件的日期
+    let recompute = {
+        let storage = storage.lock().unwrap();
+        crate::stats::StatsEngine::recompute_all(&storage)
+    };
+    match recompute {
+        Ok(n) => {
+            // 3) 重算成功才更新内存配置并落盘（内存与全局表/历史费用保持一致）
+            let mut config = config.write().unwrap();
+            config.pricing_overrides = new_map;
+            match config.save_to_file(&Config::config_path()) {
+                Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+                    "ok": true,
+                    "recomputed_dates": n,
+                })),
+                Err(e) => HttpResponse::InternalServerError().body(format!(
+                    "重算已完成但保存配置失败（本次已生效，重启将回退）: {}", e
+                )),
+            }
+        }
+        Err(e) => {
+            // 重算失败：回滚全局表到旧值，磁盘与内存配置保持不变
+            crate::models::set_pricing_overrides(old_map);
+            HttpResponse::InternalServerError()
+                .body(format!("重算失败，已回滚未保存: {}", e))
+        }
+    }
+}
+
+// 定价编辑页
+async fn pricing_page() -> HttpResponse {
+    HttpResponse::Ok().content_type("text/html").body(render_pricing_html())
+}
+
+// 设置页保存请求体（主题与轮询为前端 localStorage，不在此）
+#[derive(serde::Deserialize)]
+struct SettingsUpdate {
+    exchange_rate: Option<f64>,
+    schedule_time: Option<String>,
+    enabled_tools: Option<Vec<String>>,
+    custom_paths: Option<std::collections::HashMap<String, String>>,
+}
+
+// 设置页：返回当前数据配置（汇率/调度时间/启用工具/路径 + 内置工具状态供前端渲染）
+async fn get_settings(
+    config: web::Data<std::sync::RwLock<Config>>,
+) -> HttpResponse {
+    let cfg = config.read().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({
+        "exchange_rate": crate::models::get_usd_to_rmb(),
+        "schedule_time": cfg.schedule_time,
+        "enabled_tools": cfg.enabled_tools,
+        "custom_paths": cfg.custom_paths,
+        "builtin_tools": cfg.all_tools_status(),
+    }))
+}
+
+// 设置页：保存数据配置。汇率变动需 recompute_all 重算历史
+// 顺序原则同 update_pricing：先设运行时汇率→重算→成功才落盘；重算失败回滚运行时汇率
+async fn update_settings(
+    config: web::Data<std::sync::RwLock<Config>>,
+    storage: web::Data<std::sync::Mutex<Storage>>,
+    body: web::Json<SettingsUpdate>,
+) -> HttpResponse {
+    let req = body.into_inner();
+
+    // 校验调度时间 HH:MM
+    if let Some(st) = &req.schedule_time {
+        let parts: Vec<&str> = st.split(':').collect();
+        let valid = parts.len() == 2
+            && parts[0].parse::<u32>().map(|h| h < 24).unwrap_or(false)
+            && parts[1].parse::<u32>().map(|m| m < 60).unwrap_or(false);
+        if !valid {
+            return HttpResponse::BadRequest().body("schedule_time 格式应为 HH:MM");
+        }
+    }
+    // 校验汇率
+    if let Some(r) = req.exchange_rate {
+        if !(r > 0.0 && r.is_finite()) {
+            return HttpResponse::BadRequest().body("exchange_rate 必须为正数");
+        }
+    }
+
+    // 汇率变动：先设运行时值→重算→成功才落盘；失败回滚运行时值
+    let mut recomputed: Option<usize> = None;
+    if let Some(new_rate) = req.exchange_rate {
+        let old_rate = crate::models::get_usd_to_rmb();
+        if (new_rate - old_rate).abs() > f64::EPSILON {
+            crate::models::set_usd_to_rmb(new_rate);
+            let recompute = {
+                let storage = storage.lock().unwrap();
+                crate::stats::StatsEngine::recompute_all(&storage)
+            };
+            match recompute {
+                Ok(n) => recomputed = Some(n),
+                Err(e) => {
+                    crate::models::set_usd_to_rmb(old_rate);
+                    return HttpResponse::InternalServerError()
+                        .body(format!("重算失败，已回滚未保存: {}", e));
+                }
+            }
+        }
+    }
+
+    // 落盘全部配置项（schedule_time/enabled_tools/custom_paths 需重启 scheduler 生效，前端已提示）
+    let mut cfg = config.write().unwrap();
+    if let Some(r) = req.exchange_rate {
+        cfg.exchange_rate = r;
+    }
+    if let Some(st) = req.schedule_time {
+        cfg.schedule_time = st;
+    }
+    if let Some(t) = req.enabled_tools {
+        cfg.enabled_tools = t;
+    }
+    if let Some(p) = req.custom_paths {
+        cfg.custom_paths = p;
+    }
+    match cfg.save_to_file(&Config::config_path()) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "recomputed_dates": recomputed,
+        })),
+        Err(e) => HttpResponse::InternalServerError().body(format!(
+            "配置已生效但保存失败（重启将回退）: {}", e
+        )),
+    }
+}
+
+// 设置页
+async fn settings_page() -> HttpResponse {
+    HttpResponse::Ok().content_type("text/html").body(render_settings_html())
 }
 
 async fn get_dates(storage: web::Data<std::sync::Mutex<Storage>>) -> HttpResponse {
@@ -217,9 +394,9 @@ async fn get_cache_stats(
             let mut total_input = 0i64;
             let mut total_output = 0i64;
             let mut total_cache = 0i64;
-            // 仅 Claude Code、DeepSeek GUI、OpenCode 有缓存数据
+            // 仅 Claude Code、DeepSeek GUI、OpenCode、ZCode 有缓存数据
             let cache_supporting_tools: std::collections::HashSet<&str> =
-                ["claude_code", "deepseek_gui", "opencode"].iter().copied().collect();
+                ["claude_code", "deepseek_gui", "opencode", "zcode"].iter().copied().collect();
 
             let by_tool: Vec<CacheToolStats> = tool_map.into_iter().map(|(tool_name, (input, output, cache))| {
                 total_input += input;
@@ -320,8 +497,36 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>(function(){{var t=localStorage.getItem('vibestats-theme')||'light';document.documentElement.dataset.theme=t;}})();</script>
     <style>
         :root {{
+            --bg-deep: #F5F7FA;
+            --bg-surface: #FFFFFF;
+            --bg-elevated: #FFFFFF;
+            --bg-card: rgba(255,255,255,0.82);
+            --border-subtle: rgba(15,23,42,0.08);
+            --border-medium: rgba(15,23,42,0.12);
+            --text-primary: #0F172A;
+            --text-secondary: #475569;
+            --text-muted: #64748B;
+            --accent-cyan: #0891B2;
+            --accent-pink: #DB2777;
+            --accent-amber: #D97706;
+            --accent-lime: #059669;
+            --accent-violet: #7C3AED;
+            --gradient-hero: linear-gradient(135deg, #00B4D8 0%, #7B61FF 50%, #DB2777 100%);
+            --gradient-card: linear-gradient(180deg, rgba(15,23,42,0.025) 0%, rgba(15,23,42,0) 100%);
+            --shadow-glow: 0 0 40px rgba(8,145,178,0.06);
+            --radius-lg: 20px;
+            --radius-md: 14px;
+            --radius-sm: 10px;
+            --chart-text: #475569;
+            --chart-border: #FFFFFF;
+            --gauge-tick: #94A3B8;
+            --overlay-faint: rgba(15,23,42,0.03);
+            --overlay-soft: rgba(15,23,42,0.05);
+        }}
+        [data-theme="dark"] {{
             --bg-deep: #0B0F1A;
             --bg-surface: #111827;
             --bg-elevated: #1A2236;
@@ -339,9 +544,11 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             --gradient-hero: linear-gradient(135deg, #00E5FF 0%, #7B61FF 50%, #FF2E7D 100%);
             --gradient-card: linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 100%);
             --shadow-glow: 0 0 40px rgba(0,229,255,0.08);
-            --radius-lg: 20px;
-            --radius-md: 14px;
-            --radius-sm: 10px;
+            --chart-text: #ccc;
+            --chart-border: #1A2236;
+            --gauge-tick: #fff;
+            --overlay-faint: rgba(255,255,255,0.02);
+            --overlay-soft: rgba(255,255,255,0.04);
         }}
 
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -565,6 +772,46 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             text-transform: uppercase;
         }}
 
+        /* 各 Agent 用量明细表 */
+        .agent-detail {{
+            background: var(--gradient-card);
+            border-radius: var(--radius-md); padding: 20px 24px;
+            border: 1px solid var(--border-subtle); margin-bottom: 24px;
+        }}
+        .agent-detail h3 {{
+            margin-bottom: 14px; color: var(--text-secondary);
+            font-size: 0.92em; font-weight: 600; letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }}
+        .table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+        .agent-table {{
+            width: 100%; border-collapse: collapse; font-size: 0.88em; min-width: 760px;
+        }}
+        .agent-table th, .agent-table td {{
+            padding: 10px 12px; text-align: left;
+            border-bottom: 1px solid var(--border-subtle);
+        }}
+        .agent-table th {{
+            color: var(--text-muted); font-weight: 600; font-size: 0.8em;
+            text-transform: uppercase; letter-spacing: 0.4px;
+            background: var(--overlay-faint); white-space: nowrap;
+        }}
+        .agent-table td.num, .agent-table th.num {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
+        .agent-table td.cost {{ color: var(--accent-pink); font-weight: 600; }}
+        .agent-table tbody tr:hover {{ background: var(--overlay-faint); }}
+        .agent-table .agent-name {{ font-weight: 600; color: var(--text-primary); white-space: nowrap; }}
+        .agent-table .dot {{
+            display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+            margin-right: 8px; vertical-align: middle;
+        }}
+        .agent-table tr.total-row {{
+            font-weight: 700; border-top: 2px solid var(--border-medium);
+            background: var(--overlay-soft);
+        }}
+        .agent-table tr.total-row td {{ border-bottom: none; }}
+        .agent-table td.empty {{ text-align: center; color: var(--text-muted); padding: 24px; }}
+        @media (max-width: 600px) {{ .agent-detail {{ padding: 16px; }} .agent-table {{ font-size: 0.8em; }} }}
+
         /* 趣味换算 */
         .fun-metrics {{
             background: var(--gradient-card);
@@ -580,13 +827,13 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;
         }}
         .fun-item {{
-            background: rgba(255,255,255,0.02); border-radius: var(--radius-sm);
+            background: var(--overlay-faint); border-radius: var(--radius-sm);
             padding: 18px; border: 1px solid var(--border-subtle);
             transition: all 0.3s;
         }}
         .fun-item:hover {{
             border-color: var(--border-medium);
-            background: rgba(255,255,255,0.04);
+            background: var(--overlay-soft);
         }}
         .fun-item .fun-label {{
             color: var(--text-muted); font-size: 0.8em; font-weight: 500;
@@ -618,14 +865,14 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px;
         }}
         .tool-card {{
-            background: rgba(255,255,255,0.02); border-radius: var(--radius-sm);
+            background: var(--overlay-faint); border-radius: var(--radius-sm);
             padding: 14px; display: flex; align-items: center; gap: 12px;
             border: 1px solid var(--border-subtle);
             transition: all 0.25s;
         }}
         .tool-card:hover {{
             border-color: var(--border-medium);
-            background: rgba(255,255,255,0.04);
+            background: var(--overlay-soft);
             transform: translateX(3px);
         }}
         .tool-card.enabled {{ border-left: 3px solid var(--accent-cyan); }}
@@ -645,7 +892,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             border: 1px solid rgba(0,229,255,0.2);
         }}
         .tool-card .tool-status.off {{
-            background: rgba(255,255,255,0.03); color: var(--text-muted);
+            background: var(--overlay-faint); color: var(--text-muted);
             border: 1px solid var(--border-subtle);
         }}
 
@@ -671,6 +918,9 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
     </style>
 </head>
 <body>
+    <button id="themeToggle" onclick="toggleTheme()" title="切换浅色/深色" style="position:fixed;top:16px;right:235px;z-index:100;padding:7px 12px;border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-elevated);color:var(--text-secondary);font-size:15px;cursor:pointer;backdrop-filter:blur(6px);">☀</button>
+    <a href="/settings" style="position:fixed;top:16px;right:135px;color:var(--text-secondary);text-decoration:none;font-size:13px;z-index:100;padding:7px 14px;border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-elevated);backdrop-filter:blur(6px);">⚙ 设置</a>
+    <a href="/pricing" style="position:fixed;top:16px;right:20px;color:var(--text-secondary);text-decoration:none;font-size:13px;z-index:100;padding:7px 14px;border:1px solid var(--border-medium);border-radius:8px;background:var(--bg-elevated);backdrop-filter:blur(6px);">⚙ 模型定价</a>
     <div class="hero-glow"></div>
     <div class="app">
         <div class="header">
@@ -699,7 +949,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             <div class="summary-cards">
                 <div class="card cost">
                     <div class="label">花了多少钱</div>
-                    <div class="value" id="totalCost">$0.00</div>
+                    <div class="value" id="totalCost">¥0.00</div>
                     <div class="sub">按各工具实际模型定价</div>
                 </div>
                 <div class="card lines">
@@ -716,6 +966,28 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                     <div class="label">调了几次接口</div>
                     <div class="value" id="totalEvents">0</div>
                     <div class="sub">原始事件数量</div>
+                </div>
+            </div>
+
+            <div class="agent-detail">
+                <h3>各 Agent 用量明细</h3>
+                <div class="table-wrap">
+                    <table class="agent-table" id="agentTable">
+                        <thead>
+                            <tr>
+                                <th>Agent</th>
+                                <th class="num">输入 Token</th>
+                                <th class="num">输出 Token</th>
+                                <th class="num">缓存命中</th>
+                                <th class="num">费用</th>
+                                <th class="num">代码行数</th>
+                                <th class="num">调用次数</th>
+                                <th class="num">费用占比</th>
+                            </tr>
+                        </thead>
+                        <tbody id="agentTableBody"></tbody>
+                        <tfoot id="agentTableFoot"></tfoot>
+                    </table>
                 </div>
             </div>
 
@@ -756,7 +1028,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                     <h3>缓存命中率（不含 Cursor/Trae，本地无缓存日志）</h3>
                     <div id="cacheRateChart" style="width:100%;height:380px;"></div>
                     <div style="color:var(--text-muted);font-size:0.72em;margin-top:6px;text-align:center;">
-                        * 仅 Claude Code / DeepSeek GUI / OpenCode 支持缓存命中统计
+                        * 仅 Claude Code / DeepSeek GUI / OpenCode / ZCode 支持缓存命中统计
                     </div>
                 </div>
             </div>
@@ -780,6 +1052,21 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
         const rawData = {stats_json};
         const toolColors = {{ {color_map_js} }};
 
+        // 主题切换：浅色/深色，localStorage 持久化；ECharts 颜色走 CSS 变量，切换时重渲染
+        function cssVar(name) {{ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }}
+        function currentTheme() {{ return document.documentElement.dataset.theme || 'light'; }}
+        function applyThemeIcon() {{ document.getElementById('themeToggle').textContent = currentTheme() === 'dark' ? '🌙' : '☀'; }}
+        function toggleTheme() {{
+            var t = currentTheme() === 'dark' ? 'light' : 'dark';
+            document.documentElement.dataset.theme = t;
+            localStorage.setItem('vibestats-theme', t);
+            applyThemeIcon();
+            renderBarChart(); renderPieChart(); renderFunMetrics();
+            loadTrendData(currentTrendRange);
+            loadCacheStats();
+        }}
+        applyThemeIcon();
+
         document.addEventListener('DOMContentLoaded', () => {{
             updateSummary();
             renderBarChart();
@@ -788,13 +1075,32 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             loadCacheStats();
             renderFunMetrics();
             renderDailyReport();
+            renderAgentDetail();
             loadBuiltinTools();
             loadAvailableDates();
+            // 自动轮询：间隔读 localStorage（默认 60s，0=关闭）；设置页改动经 storage 事件即时重建
+            var pollInterval = parseInt(localStorage.getItem('vibestats-poll-interval')) || 60;
+            var pollTimer = null;
+            function startPolling() {{
+                if (pollTimer) clearInterval(pollTimer);
+                if (pollInterval > 0) pollTimer = setInterval(() => {{ if (currentStart) fetchData(currentStart, currentEnd); }}, pollInterval * 1000);
+            }}
+            startPolling();
+            // 跨标签同步：设置页改主题/轮询间隔时，本页即时响应
+            window.addEventListener('storage', function(e) {{
+                if (e.key === 'vibestats-poll-interval') {{
+                    pollInterval = parseInt(e.newValue) || 60; startPolling();
+                }} else if (e.key === 'vibestats-theme') {{
+                    document.documentElement.dataset.theme = e.newValue || 'light';
+                    applyThemeIcon(); renderBarChart(); renderPieChart(); renderFunMetrics();
+                    loadTrendData(currentTrendRange); loadCacheStats();
+                }}
+            }});
         }});
 
         function updateSummary() {{
             const t = rawData.totals;
-            document.getElementById('totalCost').textContent = '$' + t.total_estimated_cost.toFixed(2);
+            document.getElementById('totalCost').textContent = '¥' + t.total_estimated_cost.toFixed(2);
             document.getElementById('totalLines').textContent = t.total_code_lines.toLocaleString();
             document.getElementById('totalBooks').textContent = Math.max(1, Math.floor(t.total_code_lines / 30000)).toLocaleString() + ' 本';
             document.getElementById('totalEvents').textContent = t.total_events.toLocaleString();
@@ -851,7 +1157,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                 `相当于写了 <span class="highlight">${{codeLines.toLocaleString()}}</span> 行代码，` +
                 `这些代码相当于写了 <span class="highlight">${{books}}</span> 本书，` +
                 `你最喜欢用的是 <span class="tool-highlight" style="color:${{getToolColor(topTool.name)}}">${{topName}}</span>，` +
-                `花费约 <span class="cost-highlight">$${{t.total_estimated_cost.toFixed(2)}}</span>`;
+                `花费约 <span class="cost-highlight">¥${{t.total_estimated_cost.toFixed(2)}}</span>`;
 
             document.getElementById('dailyReportText').innerHTML = html;
         }}
@@ -867,21 +1173,21 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             chart.setOption({{
                 tooltip: {{ trigger: 'axis', formatter: function(params) {{
                     let s = params[0].name + '<br/>';
-                    params.forEach(p => s += p.marker + ' $' + p.value.toFixed(2));
+                    params.forEach(p => s += p.marker + ' ¥' + p.value.toFixed(2));
                     return s;
                 }}}},
                 grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
                 xAxis: {{
                     type: 'category',
                     data: tools,
-                    axisLabel: {{ color: '#ccc', rotate: 35, fontSize: 11, interval: 0 }}
+                    axisLabel: {{ color: cssVar('--chart-text'), rotate: 35, fontSize: 11, interval: 0 }}
                 }},
-                yAxis: {{ type: 'value', axisLabel: {{ color: '#ccc', formatter: v => '$' + v.toFixed(2) }} }},
+                yAxis: {{ type: 'value', axisLabel: {{ color: cssVar('--chart-text'), formatter: v => '¥' + v.toFixed(2) }} }},
                 series: [{{
                     type: 'bar',
                     data: costs.map((v, i) => ({{ value: v, itemStyle: {{ color: colors[i] }} }})),
                     barWidth: '50%',
-                    label: {{ show: true, position: 'top', color: '#ccc', fontSize: 10, formatter: p => '$' + p.value.toFixed(2) }}
+                    label: {{ show: true, position: 'top', color: cssVar('--chart-text'), fontSize: 10, formatter: p => '¥' + p.value.toFixed(2) }}
                 }}]
             }});
             window.addEventListener('resize', () => chart.resize());
@@ -898,16 +1204,74 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                 }}));
 
             chart.setOption({{
-                tooltip: {{ trigger: 'item', formatter: p => p.name + ': $' + p.value.toFixed(2) + ' (' + p.percent + '%)' }},
+                tooltip: {{ trigger: 'item', formatter: p => p.name + ': ¥' + p.value.toFixed(2) + ' (' + p.percent + '%)' }},
                 series: [{{
                     type: 'pie', radius: ['35%', '70%'], avoidLabelOverlap: false,
-                    itemStyle: {{ borderRadius: 10, borderColor: '#1a1a2e', borderWidth: 2 }},
-                    label: {{ show: true, color: '#ccc', formatter: '{{b}}\n{{d}}%' }},
+                    itemStyle: {{ borderRadius: 10, borderColor: cssVar('--chart-border'), borderWidth: 2 }},
+                    label: {{ show: true, color: cssVar('--chart-text'), formatter: '{{b}}\n{{d}}%' }},
                     emphasis: {{ label: {{ show: true, fontSize: 16, fontWeight: 'bold' }} }},
                     data: pieData
                 }}]
             }});
             window.addEventListener('resize', () => chart.resize());
+        }}
+
+        // 各 Agent 用量明细表：按工具聚合 daily_data，列示输入/输出/缓存/费用/行数/调用次数/占比
+        function renderAgentDetail() {{
+            var tbody = document.getElementById('agentTableBody');
+            var tfoot = document.getElementById('agentTableFoot');
+            if (!tbody) return;
+            var rows = rawData.by_tool.map(function(t) {{
+                var d = t.daily_data;
+                return {{
+                    name: t.tool_name,
+                    input: d.reduce(function(s, x) {{ return s + x.input_tokens; }}, 0),
+                    output: d.reduce(function(s, x) {{ return s + x.output_tokens; }}, 0),
+                    cache: d.reduce(function(s, x) {{ return s + x.cache_read_tokens; }}, 0),
+                    cost: d.reduce(function(s, x) {{ return s + x.estimated_cost; }}, 0),
+                    lines: d.reduce(function(s, x) {{ return s + x.code_lines_equivalent; }}, 0),
+                    events: d.reduce(function(s, x) {{ return s + x.event_count; }}, 0),
+                    color: getToolColor(t.tool_name)
+                }};
+            }}).sort(function(a, b) {{ return b.cost - a.cost; }});
+            var totalCost = rows.reduce(function(s, r) {{ return s + r.cost; }}, 0);
+            if (rows.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+                tfoot.innerHTML = '';
+                return;
+            }}
+            var fmtInt = function(v) {{ return v.toLocaleString(); }};
+            var fmtCost = function(v) {{ return '¥' + v.toFixed(2); }};
+            var html = '';
+            rows.forEach(function(r) {{
+                var pct = totalCost > 0 ? (r.cost / totalCost * 100).toFixed(1) : '0.0';
+                html += '<tr>' +
+                    '<td class="agent-name"><span class="dot" style="background:' + r.color + '"></span>' + r.name + '</td>' +
+                    '<td class="num">' + fmtInt(r.input) + '</td>' +
+                    '<td class="num">' + fmtInt(r.output) + '</td>' +
+                    '<td class="num">' + fmtInt(r.cache) + '</td>' +
+                    '<td class="num cost">' + fmtCost(r.cost) + '</td>' +
+                    '<td class="num">' + fmtInt(r.lines) + '</td>' +
+                    '<td class="num">' + fmtInt(r.events) + '</td>' +
+                    '<td class="num">' + pct + '%</td>' +
+                    '</tr>';
+            }});
+            tbody.innerHTML = html;
+            var ti = rows.reduce(function(s, r) {{ return s + r.input; }}, 0);
+            var to = rows.reduce(function(s, r) {{ return s + r.output; }}, 0);
+            var tc = rows.reduce(function(s, r) {{ return s + r.cache; }}, 0);
+            var tl = rows.reduce(function(s, r) {{ return s + r.lines; }}, 0);
+            var te = rows.reduce(function(s, r) {{ return s + r.events; }}, 0);
+            tfoot.innerHTML = '<tr class="total-row">' +
+                '<td>合计</td>' +
+                '<td class="num">' + fmtInt(ti) + '</td>' +
+                '<td class="num">' + fmtInt(to) + '</td>' +
+                '<td class="num">' + fmtInt(tc) + '</td>' +
+                '<td class="num cost">' + fmtCost(totalCost) + '</td>' +
+                '<td class="num">' + fmtInt(tl) + '</td>' +
+                '<td class="num">' + fmtInt(te) + '</td>' +
+                '<td class="num">100.0%</td>' +
+                '</tr>';
         }}
 
         let trendChartInstance = null;
@@ -968,17 +1332,17 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                 tooltip: {{ trigger: 'axis', formatter: function(params) {{
                     let s = params[0].axisValue + '<br/>';
                     params.forEach(p => {{
-                        if (p.value > 0) s += p.marker + ' ' + p.seriesName + ': $' + p.value.toFixed(2) + '<br/>';
+                        if (p.value > 0) s += p.marker + ' ' + p.seriesName + ': ¥' + p.value.toFixed(2) + '<br/>';
                     }});
                     return s;
                 }}}},
-                legend: {{ textStyle: {{ color: '#ccc' }}, top: 0 }},
+                legend: {{ textStyle: {{ color: cssVar('--chart-text') }}, top: 0 }},
                 grid: {{ left: '3%', right: '4%', bottom: '3%', top: 40, containLabel: true }},
                 xAxis: {{
                     type: 'category', data: labels, boundaryGap: false,
-                    axisLabel: {{ color: '#ccc', rotate: isHourly ? 30 : 0, fontSize: 11 }}
+                    axisLabel: {{ color: cssVar('--chart-text'), rotate: isHourly ? 30 : 0, fontSize: 11 }}
                 }},
-                yAxis: {{ type: 'value', axisLabel: {{ color: '#ccc', formatter: v => '$' + v.toFixed(2) }} }},
+                yAxis: {{ type: 'value', axisLabel: {{ color: cssVar('--chart-text'), formatter: v => '¥' + v.toFixed(2) }} }},
                 series: series
             }}, true);
         }}
@@ -1022,7 +1386,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                 <div class="fun-item">
                     <div class="fun-label">${{m.label}}</div>
                     <div class="fun-value">${{m.value}}</div>
-                    <div style="color:#666;font-size:0.78em;margin-top:2px">${{m.desc}}</div>
+                    <div style="color:var(--text-muted);font-size:0.78em;margin-top:2px">${{m.desc}}</div>
                 </div>
             `).join('');
         }}
@@ -1095,31 +1459,31 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                         return s;
                     }}
                 }},
-                legend: {{ textStyle: {{ color: '#ccc' }}, top: 0 }},
+                legend: {{ textStyle: {{ color: cssVar('--chart-text') }}, top: 0 }},
                 grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
                 xAxis: {{
                     type: 'category',
                     data: tools.map(t => toolDisplayNames[t] || t),
-                    axisLabel: {{ color: '#ccc', rotate: 30, fontSize: 11, interval: 0 }}
+                    axisLabel: {{ color: cssVar('--chart-text'), rotate: 30, fontSize: 11, interval: 0 }}
                 }},
-                yAxis: {{ type: 'value', axisLabel: {{ color: '#ccc', formatter: v => formatTokens(v) }} }},
+                yAxis: {{ type: 'value', axisLabel: {{ color: cssVar('--chart-text'), formatter: v => formatTokens(v) }} }},
                 series: [
                     {{
                         name: '输入 Tokens', type: 'bar', stack: 'total',
                         data: data.by_tool.map(t => t.input_tokens),
-                        itemStyle: {{ color: '#00E5FF' }},
+                        itemStyle: {{ color: cssVar('--accent-cyan') }},
                         emphasis: {{ focus: 'series' }}
                     }},
                     {{
                         name: '输出 Tokens', type: 'bar', stack: 'total',
                         data: data.by_tool.map(t => t.output_tokens),
-                        itemStyle: {{ color: '#FF2E7D' }},
+                        itemStyle: {{ color: cssVar('--accent-pink') }},
                         emphasis: {{ focus: 'series' }}
                     }},
                     {{
                         name: '缓存命中 Tokens', type: 'bar', stack: 'total',
                         data: data.by_tool.map(t => t.cache_read_tokens),
-                        itemStyle: {{ color: '#7EE787' }},
+                        itemStyle: {{ color: cssVar('--accent-lime') }},
                         emphasis: {{ focus: 'series' }}
                     }}
                 ]
@@ -1160,20 +1524,20 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                             itemStyle: {{ color: 'auto' }},
                             width: 4, length: '60%'
                         }},
-                        axisTick: {{ distance: -18, length: 6, lineStyle: {{ color: '#fff', width: 1 }} }},
-                        splitLine: {{ distance: -18, length: 18, lineStyle: {{ color: '#fff', width: 2 }} }},
-                        axisLabel: {{ color: '#999', distance: 25, fontSize: 11 }},
+                        axisTick: {{ distance: -18, length: 6, lineStyle: {{ color: cssVar('--gauge-tick'), width: 1 }} }},
+                        splitLine: {{ distance: -18, length: 18, lineStyle: {{ color: cssVar('--gauge-tick'), width: 2 }} }},
+                        axisLabel: {{ color: cssVar('--chart-text'), distance: 25, fontSize: 11 }},
                         detail: {{
                             valueAnimation: true,
                             formatter: function(v) {{ return v + '%'; }},
-                            color: '#00E5FF',
+                            color: cssVar('--accent-cyan'),
                             fontSize: 28, fontWeight: 700,
                             offsetCenter: [0, '70%']
                         }},
                         title: {{
                             offsetCenter: [0, '85%'],
                             fontSize: 12,
-                            color: '#888',
+                            color: cssVar('--chart-text'),
                         }},
                         data: [{{ value: overallRate, name: '命中率 (Claude Code + DeepSeek GUI)' }}]
                     }}
@@ -1184,6 +1548,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
 
         let currentRangeLabel = '昨日';
         let currentDataRange = 'yesterday';  // yesterday / last_week / last_month / all_time
+        let currentStart = '{yesterday_str}', currentEnd = '{yesterday_str}';  // 轮询复用当前视图的日期范围
 
         function updateCardLabels(rangeLabel) {{
             currentRangeLabel = rangeLabel;
@@ -1256,6 +1621,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
         }}
 
         function fetchData(start, end) {{
+            currentStart = start; currentEnd = end;
             fetch(`/api/stats/range?start=${{start}}&end=${{end}}`)
                 .then(r => r.json())
                 .then(data => {{
@@ -1267,6 +1633,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                     renderPieChart();
                     renderFunMetrics();
                     renderDailyReport();
+                    renderAgentDetail();
                 }});
             loadTrendData(currentTrendRange);
             fetchCacheStats(start, end);
@@ -1389,4 +1756,334 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
 </html>"##, stats_json = stats_json, color_map_js = color_map_js, yesterday_str = yesterday_str);
 
     Ok(html)
+}
+
+/// 模型定价编辑页（独立 HTML，无 format! 插值，花括号按字面量处理）
+fn render_pricing_html() -> String {
+    r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VibeStats · 模型定价</title>
+<script>(function(){var t=localStorage.getItem('vibestats-theme')||'light';document.documentElement.dataset.theme=t;})();</script>
+<style>
+  :root { --bg:#F5F7FA; --card:#FFFFFF; --text:#0F172A; --muted:#64748B; --accent:#7C3AED; --border:rgba(15,23,42,0.12); --input-bg:#F8FAFC; --accent-hover:#6D28D9; --danger:#E11D48; --ok:#059669; }
+  [data-theme="dark"] { --bg:#0B1120; --card:#1E293B; --text:#E2E8F0; --muted:#94A3B8; --accent:#7C3AED; --border:rgba(148,163,184,0.2); --input-bg:#0F172A; --accent-hover:#6D28D9; --danger:#F87171; --ok:#34D399; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; padding:28px 16px; }
+  .card { max-width:900px; margin:0 auto; background:var(--card); border:1px solid var(--border); border-radius:14px; padding:28px; }
+  a.back { color:var(--muted); text-decoration:none; font-size:14px; }
+  a.back:hover { color:var(--text); }
+  h1 { font-size:24px; margin:14px 0 4px; }
+  .tagline { color:var(--muted); margin:0 0 8px; font-size:14px; }
+  table { width:100%; border-collapse:collapse; margin-top:18px; }
+  th, td { padding:10px 8px; text-align:left; border-bottom:1px solid var(--border); font-size:14px; vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px; }
+  td input { width:100%; background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px; }
+  td input.name { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  td input:focus { outline:none; border-color:var(--accent); }
+  .actions { display:flex; gap:12px; margin-top:22px; align-items:center; flex-wrap:wrap; }
+  button { cursor:pointer; border:none; border-radius:8px; padding:10px 18px; font-size:14px; font-weight:600; }
+  button.primary { background:var(--accent); color:#fff; }
+  button.primary:hover { background:var(--accent-hover); }
+  button.ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+  button.danger { background:transparent; color:var(--danger); border:1px solid rgba(248,113,113,0.3); padding:6px 10px; font-size:12px; }
+  #status { font-size:13px; color:var(--muted); margin-left:8px; }
+  #status.ok { color:var(--ok); }
+  #status.err { color:var(--danger); }
+  .hint { color:var(--muted); font-size:12px; margin-top:14px; line-height:1.6; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <a class="back" href="/">← 返回 Dashboard</a>
+    <a href="/settings" style="position:fixed;top:16px;right:20px;color:var(--muted);text-decoration:none;font-size:13px;z-index:100;padding:7px 14px;border:1px solid var(--border);border-radius:8px;background:var(--card);">⚙ 设置</a>
+    <button id="themeToggle" onclick="toggleTheme()" title="切换浅色/深色" style="position:fixed;top:16px;right:90px;z-index:100;padding:7px 12px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--muted);font-size:15px;cursor:pointer;">☀</button>
+    <h1>模型定价</h1>
+    <p class="tagline" id="tagline">单位：人民币（¥）/ 百万 Token。保存后立即按新价重算全部历史费用。</p>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:36%">模型名</th>
+          <th>输入</th>
+          <th>输出</th>
+          <th>缓存读</th>
+          <th style="width:72px"></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="actions">
+      <button class="ghost" onclick="addRow('',0,0,0,true)">+ 添加模型</button>
+      <button class="primary" onclick="save()">保存并重算</button>
+      <span id="status"></span>
+    </div>
+    <p class="hint">说明：列出的模型来自历史记录与已保存的覆盖项；名称保存时会自动转小写。删除某行并保存后，该模型将回退到内置硬编码定价。<br>「default」为未识别模型（日志无模型名）的兜底价；日志带原始计费的工具（如 DeepSeek GUI）按原始计费显示，改价不重算其历史费用。</p>
+  </div>
+
+<script>
+var RATE = 7.2; // 美元→人民币汇率，须与 models.rs::DEFAULT_USD_TO_RMB 一致
+function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function currentTheme(){ return document.documentElement.dataset.theme || 'light'; }
+function applyThemeIcon(){ document.getElementById('themeToggle').textContent = currentTheme()==='dark' ? '🌙' : '☀'; }
+function toggleTheme(){ var t = currentTheme()==='dark' ? 'light' : 'dark'; document.documentElement.dataset.theme=t; localStorage.setItem('vibestats-theme',t); applyThemeIcon(); }
+applyThemeIcon();
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+function num(n){ n = Number(n); if(!isFinite(n) || n===0){ return '0'; } return String(Math.round(n*1e6)/1e6); }
+function setStatus(msg, cls){ var s=document.getElementById('status'); s.textContent=msg; s.className=cls||''; }
+
+function row(name, input, output, cache, focusName){
+  var tr = document.createElement('tr');
+  tr.innerHTML =
+      '<td><input class="name" type="text" value="'+esc(name)+'" placeholder="model-name"></td>'
+    + '<td><input type="number" step="0.01" min="0" value="'+num(input)+'"></td>'
+    + '<td><input type="number" step="0.01" min="0" value="'+num(output)+'"></td>'
+    + '<td><input type="number" step="0.01" min="0" value="'+num(cache)+'"></td>'
+    + '<td><button class="danger" onclick="this.closest(\'tr\').remove()">删除</button></td>';
+  document.getElementById('rows').appendChild(tr);
+  if(focusName){ tr.querySelector('input.name').focus(); }
+}
+function addRow(name,i,o,c,f){ row(name,i,o,c,f); }
+
+function load(){
+  setStatus('加载中...');
+  fetch('/api/pricing').then(function(r){ return r.json(); }).then(function(res){
+    RATE = res.rate || 7.2;
+    var map = res.models || res;
+    var tg = document.getElementById('tagline'); if(tg){ tg.textContent = '单位：人民币（¥）/ 百万 Token · 1 USD = '+RATE+' ¥。保存后立即按新价重算全部历史费用。'; }
+    var tbody = document.getElementById('rows'); tbody.innerHTML='';
+    var keys = Object.keys(map).sort();
+    if(keys.length===0){ addRow('',0,0,0,false); }
+    keys.forEach(function(k){ row(k, map[k].input*RATE, map[k].output*RATE, map[k].cache_read*RATE, false); });
+    setStatus('');
+  }).catch(function(e){ setStatus('加载失败: '+e, 'err'); });
+}
+
+function save(){
+  var map = {};
+  var ok = true;
+  document.querySelectorAll('#rows tr').forEach(function(tr){
+    var inputs = tr.querySelectorAll('input');
+    var name = inputs[0].value.trim().toLowerCase();
+    if(!name){ return; }
+    var i = parseFloat(inputs[1].value);
+    var o = parseFloat(inputs[2].value);
+    var c = parseFloat(inputs[3].value);
+    if(isNaN(i)||isNaN(o)||isNaN(c)||i<0||o<0||c<0){ ok=false; }
+    map[name] = { input: (isNaN(i)?0:i)/RATE, output: (isNaN(o)?0:o)/RATE, cache_read: (isNaN(c)?0:c)/RATE };
+  });
+  if(!ok){ setStatus('存在无效数值，请检查输入', 'err'); return; }
+  setStatus('保存并重算中...');
+  fetch('/api/pricing', {
+    method:'PUT',
+    headers:{ 'Content-Type':'application/json' },
+    body: JSON.stringify(map)
+  }).then(function(r){
+    if(!r.ok){ throw new Error('HTTP '+r.status); }
+    return r.json();
+  }).then(function(res){
+    setStatus('已保存，重算 '+res.recomputed_dates+' 个日期 ✓', 'ok');
+    setTimeout(function(){ setStatus(''); }, 6000);
+  }).catch(function(e){ setStatus('保存失败: '+e.message, 'err'); });
+}
+
+load();
+</script>
+</body>
+</html>"##.to_string()
+}
+
+/// 设置页（独立 HTML，无 format! 插值，花括号按字面量处理）
+fn render_settings_html() -> String {
+    r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VibeStats · 设置</title>
+<script>(function(){var t=localStorage.getItem('vibestats-theme')||'light';document.documentElement.dataset.theme=t;})();</script>
+<style>
+  :root { --bg:#F5F7FA; --card:#FFFFFF; --text:#0F172A; --muted:#64748B; --accent:#7C3AED; --border:rgba(15,23,42,0.12); --input-bg:#F8FAFC; --accent-hover:#6D28D9; --danger:#E11D48; --ok:#059669; }
+  [data-theme="dark"] { --bg:#0B1120; --card:#1E293B; --text:#E2E8F0; --muted:#94A3B8; --accent:#7C3AED; --border:rgba(148,163,184,0.2); --input-bg:#0F172A; --accent-hover:#6D28D9; --danger:#F87171; --ok:#34D399; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; padding:28px 16px; }
+  .card { max-width:860px; margin:0 auto; background:var(--card); border:1px solid var(--border); border-radius:14px; padding:28px; }
+  a.back { color:var(--muted); text-decoration:none; font-size:14px; }
+  a.back:hover { color:var(--text); }
+  h1 { font-size:24px; margin:14px 0 4px; }
+  .tagline { color:var(--muted); margin:0 0 8px; font-size:14px; }
+  section { margin-top:26px; padding-top:18px; border-top:1px solid var(--border); }
+  section:first-of-type { border-top:none; padding-top:6px; }
+  h2 { font-size:16px; margin:0 0 4px; }
+  .sec-hint { color:var(--muted); font-size:12px; margin:0 0 14px; line-height:1.6; }
+  .row { display:flex; align-items:center; gap:12px; margin:10px 0; flex-wrap:wrap; }
+  .row > label { font-size:14px; min-width:120px; color:var(--text); }
+  .row input[type=number], .row input[type=text] { background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:8px 10px; font-size:14px; }
+  .row input[type=number] { width:120px; }
+  .row .unit { color:var(--muted); font-size:13px; }
+  .theme-pick { display:flex; gap:10px; }
+  .theme-pick > label { display:flex; align-items:center; gap:6px; cursor:pointer; border:1px solid var(--border); border-radius:8px; padding:8px 14px; font-size:14px; background:var(--input-bg); min-width:auto; }
+  .theme-pick input { accent-color:var(--accent); }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th, td { padding:10px 8px; text-align:left; border-bottom:1px solid var(--border); font-size:14px; vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px; }
+  td input[type=text] { width:100%; background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:7px 10px; font-size:13px; }
+  td input:focus { outline:none; border-color:var(--accent); }
+  td input[type=checkbox] { accent-color:var(--accent); width:18px; height:18px; cursor:pointer; }
+  .tool-name { font-weight:600; }
+  .tool-id { font-size:11px; color:var(--muted); font-weight:normal; }
+  .actions { display:flex; gap:12px; margin-top:22px; align-items:center; flex-wrap:wrap; }
+  button { cursor:pointer; border:none; border-radius:8px; padding:10px 18px; font-size:14px; font-weight:600; }
+  button.primary { background:var(--accent); color:#fff; }
+  button.primary:hover { background:var(--accent-hover); }
+  #status { font-size:13px; color:var(--muted); margin-left:8px; }
+  #status.ok { color:var(--ok); }
+  #status.err { color:var(--danger); }
+  .note { color:var(--muted); font-size:12px; margin-top:6px; line-height:1.6; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <a class="back" href="/">← 返回 Dashboard</a>
+    <button id="themeToggle" onclick="toggleTheme()" title="切换浅色/深色" style="position:fixed;top:16px;right:20px;z-index:100;padding:7px 12px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--muted);font-size:15px;cursor:pointer;">☀</button>
+    <h1>设置</h1>
+    <p class="tagline">调整显示偏好与数据配置。</p>
+
+    <section>
+      <h2>显示偏好</h2>
+      <p class="sec-hint">主题与轮询间隔保存在浏览器本地，即时生效于已打开的 Dashboard（无需点保存）。</p>
+      <div class="row">
+        <label>主题</label>
+        <div class="theme-pick">
+          <label><input type="radio" name="theme" value="light"> ☀ 浅色</label>
+          <label><input type="radio" name="theme" value="dark"> 🌙 深色</label>
+        </div>
+      </div>
+      <div class="row">
+        <label>轮询间隔</label>
+        <input id="pollInterval" type="number" min="10" step="1" style="width:100px"> <span class="unit">秒（0 或勾选下方即关闭）</span>
+        <label style="min-width:auto"><input id="pollOff" type="checkbox"> 关闭轮询</label>
+      </div>
+    </section>
+
+    <section>
+      <h2>数据配置</h2>
+      <p class="sec-hint">以下项保存到 config.toml。汇率改动后立即重算全部历史费用；调度时间与工具列表需重启服务后于下次调度生效。</p>
+      <div class="row">
+        <label>汇率</label>
+        <input id="exchangeRate" type="number" min="0.01" step="0.01"> <span class="unit">1 USD = ? CNY</span>
+      </div>
+      <div class="row">
+        <label>调度时间</label>
+        <input id="scheduleTime" type="text" placeholder="HH:MM"> <span class="unit">每日统计时刻（24h）</span>
+      </div>
+      <div class="row" style="flex-direction:column;align-items:stretch">
+        <label>启用工具</label>
+        <table>
+          <thead><tr><th style="width:48px">启用</th><th>工具</th><th>自定义日志路径（留空用默认）</th></tr></thead>
+          <tbody id="toolRows"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="save()">保存</button>
+        <span id="status"></span>
+      </div>
+      <p class="note">说明：调度时间与工具列表改动后需重启 VibeStats 服务才会生效；汇率保存后立即重算历史费用。</p>
+    </section>
+  </div>
+
+<script>
+function currentTheme(){ return document.documentElement.dataset.theme || 'light'; }
+function applyThemeIcon(){ document.getElementById('themeToggle').textContent = currentTheme()==='dark' ? '🌙' : '☀'; }
+function applyTheme(t){
+  document.documentElement.dataset.theme = t;
+  localStorage.setItem('vibestats-theme', t);
+  applyThemeIcon();
+  document.querySelectorAll('input[name=theme]').forEach(function(r){ r.checked = (r.value===t); });
+}
+function toggleTheme(){ applyTheme(currentTheme()==='dark' ? 'light' : 'dark'); }
+applyThemeIcon();
+
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+function setStatus(msg, cls){ var s=document.getElementById('status'); s.textContent=msg; s.className=cls||''; }
+
+// 显示偏好：即时写 localStorage
+function initDisplayPrefs(){
+  var t = localStorage.getItem('vibestats-theme') || 'light';
+  document.querySelectorAll('input[name=theme]').forEach(function(r){ r.checked = (r.value===t); });
+  document.querySelectorAll('input[name=theme]').forEach(function(r){
+    r.addEventListener('change', function(){ if(r.checked) applyTheme(r.value); });
+  });
+  var pi = parseInt(localStorage.getItem('vibestats-poll-interval'));
+  if(isNaN(pi)){ pi = 60; }
+  var off = document.getElementById('pollOff');
+  var inp = document.getElementById('pollInterval');
+  if(pi <= 0){ off.checked = true; inp.value = 60; inp.disabled = true; }
+  else { off.checked = false; inp.value = pi; inp.disabled = false; }
+  off.addEventListener('change', function(){
+    if(off.checked){ localStorage.setItem('vibestats-poll-interval','0'); inp.disabled = true; }
+    else { var v = parseInt(inp.value)||60; if(v<10){ v=10; inp.value=10; } localStorage.setItem('vibestats-poll-interval', String(v)); inp.disabled=false; }
+  });
+  inp.addEventListener('change', function(){
+    var v = parseInt(inp.value); if(isNaN(v)||v<10){ v=10; inp.value=10; }
+    if(!off.checked){ localStorage.setItem('vibestats-poll-interval', String(v)); }
+  });
+}
+
+// 数据配置：GET 加载 / PUT 保存
+function load(){
+  setStatus('加载中...');
+  fetch('/api/settings').then(function(r){ return r.json(); }).then(function(res){
+    document.getElementById('exchangeRate').value = res.exchange_rate;
+    document.getElementById('scheduleTime').value = res.schedule_time || '00:30';
+    var tbody = document.getElementById('toolRows'); tbody.innerHTML='';
+    var enabled = {}; (res.enabled_tools||[]).forEach(function(id){ enabled[id]=true; });
+    var paths = res.custom_paths || {};
+    (res.builtin_tools||[]).forEach(function(t){
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td><input type="checkbox" data-id="'+t.id+'"'+(enabled[t.id]?' checked':'')+'></td>'
+        + '<td class="tool-name">'+esc(t.display_name)+'<div class="tool-id">'+esc(t.id)+'</div></td>'
+        + '<td><input type="text" data-path="'+t.id+'" placeholder="'+esc(t.default_path||'默认路径')+'" value="'+esc(paths[t.id]||'')+'"></td>';
+      tbody.appendChild(tr);
+    });
+    setStatus('');
+  }).catch(function(e){ setStatus('加载失败: '+e, 'err'); });
+}
+
+function save(){
+  var rate = parseFloat(document.getElementById('exchangeRate').value);
+  if(isNaN(rate)||rate<=0){ setStatus('汇率必须为正数', 'err'); return; }
+  var st = document.getElementById('scheduleTime').value.trim();
+  if(!/^\d{1,2}:\d{2}$/.test(st)){ setStatus('调度时间格式应为 HH:MM', 'err'); return; }
+  var enabled = []; var paths = {};
+  document.querySelectorAll('#toolRows tr').forEach(function(tr){
+    var cb = tr.querySelector('input[type=checkbox]');
+    var inp = tr.querySelector('input[type=text]');
+    var id = cb.getAttribute('data-id');
+    if(cb.checked){ enabled.push(id); }
+    var p = inp.value.trim();
+    if(p){ paths[id]=p; }
+  });
+  setStatus('保存中...');
+  fetch('/api/settings', {
+    method:'PUT',
+    headers:{ 'Content-Type':'application/json' },
+    body: JSON.stringify({ exchange_rate: rate, schedule_time: st, enabled_tools: enabled, custom_paths: paths })
+  }).then(function(r){
+    if(!r.ok){ throw new Error('HTTP '+r.status); }
+    return r.json();
+  }).then(function(res){
+    var msg = '已保存 ✓';
+    if(res.recomputed_dates!=null){ msg = '已保存，重算 '+res.recomputed_dates+' 个日期 ✓'; }
+    setStatus(msg, 'ok');
+    setTimeout(function(){ setStatus(''); }, 6000);
+  }).catch(function(e){ setStatus('保存失败: '+e.message, 'err'); });
+}
+
+initDisplayPrefs();
+load();
+</script>
+</body>
+</html>"##.to_string()
 }

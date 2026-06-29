@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use chrono::NaiveDate;
-use log::{debug, info};
+use log::{debug, info, warn};
 use rusqlite::{params, Connection, Result as SqlResult};
 
+use crate::config::ToolConfig;
 use crate::models::{CacheStats, DailyStats, RawEvent, TrendPoint};
 
 /// SQLite 存储管理器
@@ -320,6 +321,34 @@ impl Storage {
         Ok(dates)
     }
 
+    /// 获取所有出现过的模型名（去重，排除 NULL，升序），用于定价页列出可调项
+    pub fn get_distinct_models(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT model_name FROM raw_events WHERE model_name IS NOT NULL ORDER BY model_name"
+        )?;
+        let models = stmt.query_map([], |row| row.get(0))?.collect::<SqlResult<Vec<_>>>()?;
+        Ok(models)
+    }
+
+    /// 获取所有有原始事件记录的日期（去重，升序），用于改价后整体重算
+    pub fn get_all_raw_event_dates(&self) -> anyhow::Result<Vec<NaiveDate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT substr(timestamp, 1, 10) FROM raw_events ORDER BY 1"
+        )?;
+        let strs: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<SqlResult<Vec<_>>>()?;
+        // 单个坏 timestamp 不应阻断整体重算：跳过并告警，而非让整批失败
+        let dates = strs.iter()
+            .filter_map(|s| match NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                Ok(d) => Some(d),
+                Err(_) => {
+                    warn!("跳过无法解析的日期: {}", s);
+                    None
+                }
+            })
+            .collect();
+        Ok(dates)
+    }
+
     /// 获取指定日期范围的缓存统计数据（从 daily_stats 聚合）
     pub fn get_cache_stats(
         &self,
@@ -344,6 +373,94 @@ impl Storage {
         })?.collect::<SqlResult<Vec<_>>>()?;
 
         Ok(stats)
+    }
+
+    /// 替换某工具在所涉日期上的原始事件（快照式解析器专用）。
+    /// 先按 (tool, date) 删除旧事件再插入新事件，避免快照解析器重复累加。
+    fn replace_raw_events_for_tool(
+        &self,
+        tool_name: &str,
+        events: &[RawEvent],
+    ) -> anyhow::Result<usize> {
+        use std::collections::BTreeSet;
+        let tx = self.conn.unchecked_transaction()?;
+
+        // 收集本次新事件涉及的所有日期（timestamp 前 10 位 = YYYY-MM-DD）
+        let dates: BTreeSet<String> = events
+            .iter()
+            .filter_map(|e| e.timestamp.get(..10).map(|s| s.to_string()))
+            .collect();
+
+        // 先删除这些 (tool, date) 的旧事件，避免快照重复累加
+        for d in &dates {
+            tx.execute(
+                "DELETE FROM raw_events WHERE tool_name = ?1 AND substr(timestamp, 1, 10) = ?2",
+                params![tool_name, d],
+            )?;
+        }
+
+        // 再插入新事件（OR IGNORE 防止同批内 (timestamp,tool,input,output) 偶然重复）
+        let mut inserted = 0;
+        for e in events {
+            inserted += tx.execute(
+                "INSERT OR IGNORE INTO raw_events (tool_name, timestamp, input_tokens, output_tokens, cache_read_tokens, model_name, actual_cost, raw_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    e.tool_name,
+                    e.timestamp,
+                    e.input_tokens,
+                    e.output_tokens,
+                    e.cache_read_tokens,
+                    e.model_name,
+                    e.actual_cost,
+                    e.raw_line,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        debug!(
+            "替换 {} 的 {} 个日期共 {} 条原始事件",
+            tool_name,
+            dates.len(),
+            inserted
+        );
+        Ok(inserted)
+    }
+
+    /// 按工具的日志格式写入原始事件。
+    /// - 快照式解析器（ZCode/OpenCode/TraeCN/Cursor/Codex）：按 (tool, date) 替换，避免重复累加。
+    /// - 增量式解析器（ClaudeCode/DeepSeekGui/CopilotJb/Generic）：按唯一约束 INSERT OR IGNORE 去重。
+    pub fn store_parsed(
+        &self,
+        events: &[RawEvent],
+        tools: &[ToolConfig],
+    ) -> anyhow::Result<usize> {
+        use std::collections::HashMap;
+
+        // 工具名 -> 是否快照式（未登记的工具默认走增量去重，安全）
+        let fmt_map: HashMap<&str, bool> = tools
+            .iter()
+            .map(|t| (t.name.as_str(), crate::config::is_snapshot_format(&t.log_format)))
+            .collect();
+
+        // 按工具名分组
+        let mut by_tool: HashMap<&str, Vec<&RawEvent>> = HashMap::new();
+        for e in events {
+            by_tool.entry(e.tool_name.as_str()).or_default().push(e);
+        }
+
+        let mut total = 0;
+        for (tool_name, evs) in by_tool {
+            let is_snapshot = fmt_map.get(tool_name).copied().unwrap_or(false);
+            let owned: Vec<RawEvent> = evs.iter().map(|e| (*e).clone()).collect();
+            if is_snapshot {
+                total += self.replace_raw_events_for_tool(tool_name, &owned)?;
+            } else {
+                total += self.insert_raw_events(&owned)?;
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -636,5 +753,107 @@ mod tests {
         assert_eq!(dates.len(), 2, "应有 2 个日期");
         assert_eq!(dates[0], "2026-06-09", "日期应降序排列");
         assert_eq!(dates[1], "2026-06-08");
+    }
+
+    #[test]
+    fn test_get_distinct_models() {
+        let (storage, _dir) = create_test_storage();
+        let events = vec![
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-09T10:00:00".to_string(),
+                input_tokens: 100, output_tokens: 50, cache_read_tokens: 30,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("test".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-09T11:00:00".to_string(),
+                input_tokens: 200, output_tokens: 100, cache_read_tokens: 60,
+                model_name: Some("glm-5.2".to_string()),
+                actual_cost: None, raw_line: Some("test2".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "cursor".to_string(),
+                timestamp: "2026-06-09T12:00:00".to_string(),
+                input_tokens: 50, output_tokens: 25, cache_read_tokens: 0,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("test3".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "cursor".to_string(),
+                timestamp: "2026-06-09T13:00:00".to_string(),
+                input_tokens: 50, output_tokens: 25, cache_read_tokens: 0,
+                model_name: None,
+                actual_cost: None, raw_line: Some("test4".to_string()),
+            },
+        ];
+        storage.insert_raw_events(&events).unwrap();
+
+        let models = storage.get_distinct_models().unwrap();
+        assert_eq!(models, vec!["claude-sonnet-4".to_string(), "glm-5.2".to_string()],
+            "应去重、排除 NULL、升序");
+    }
+
+    #[test]
+    fn test_get_all_raw_event_dates() {
+        let (storage, _dir) = create_test_storage();
+        let events = vec![
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-08T10:00:00".to_string(),
+                input_tokens: 100, output_tokens: 50, cache_read_tokens: 30,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("test".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-09T11:00:00".to_string(),
+                input_tokens: 200, output_tokens: 100, cache_read_tokens: 60,
+                model_name: Some("glm-5.2".to_string()),
+                actual_cost: None, raw_line: Some("test2".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-09T12:00:00".to_string(),
+                input_tokens: 50, output_tokens: 25, cache_read_tokens: 0,
+                model_name: Some("glm-5.2".to_string()),
+                actual_cost: None, raw_line: Some("test3".to_string()),
+            },
+        ];
+        storage.insert_raw_events(&events).unwrap();
+
+        let dates = storage.get_all_raw_event_dates().unwrap();
+        assert_eq!(dates.len(), 2, "应有 2 个日期");
+        assert_eq!(dates[0], NaiveDate::parse_from_str("2026-06-08", "%Y-%m-%d").unwrap(),
+            "应升序");
+        assert_eq!(dates[1], NaiveDate::parse_from_str("2026-06-09", "%Y-%m-%d").unwrap());
+    }
+
+    #[test]
+    fn test_get_all_raw_event_dates_skips_malformed() {
+        let (storage, _dir) = create_test_storage();
+        let events = vec![
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-08T10:00:00".to_string(),
+                input_tokens: 100, output_tokens: 50, cache_read_tokens: 30,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("ok".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "not-a-valid-date".to_string(),
+                input_tokens: 100, output_tokens: 50, cache_read_tokens: 30,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("bad".to_string()),
+            },
+        ];
+        storage.insert_raw_events(&events).unwrap();
+
+        // 坏日期应被跳过而非让整批失败
+        let dates = storage.get_all_raw_event_dates().unwrap();
+        assert_eq!(dates.len(), 1, "应仅返回可解析的 1 个日期");
+        assert_eq!(dates[0], NaiveDate::parse_from_str("2026-06-08", "%Y-%m-%d").unwrap());
     }
 }

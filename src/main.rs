@@ -11,7 +11,7 @@ mod stats;
 mod storage;
 
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
 
 use config::Config;
 use storage::Storage;
@@ -57,6 +57,10 @@ fn main() -> anyhow::Result<()> {
 
     // 加载配置
     let config = load_config(&args)?;
+    // 注入定价覆盖表（来自 config.toml 的 [pricing_overrides]），供 get_model_pricing 优先查询
+    crate::models::set_pricing_overrides(config.pricing_overrides.clone());
+    // 注入运行时汇率（来自 config.exchange_rate），供 aggregate_daily 折算人民币
+    crate::models::set_usd_to_rmb(config.exchange_rate);
     info!("配置加载完成");
 
     // 确保数据目录存在
@@ -86,7 +90,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
         if !events.is_empty() {
-            storage.insert_raw_events(&events)?;
+            storage.store_parsed(&events, &enabled_tools)?;
             parser.save_pointers();
             info!("事件已保存到数据库");
         }
@@ -122,7 +126,7 @@ fn main() -> anyhow::Result<()> {
         info!("全量解析到 {} 条事件", events.len());
 
         if !events.is_empty() {
-            storage.insert_raw_events(&events)?;
+            storage.store_parsed(&events, &enabled_tools)?;
             parser.save_pointers();
 
             // 重新计算所有每日统计
@@ -132,14 +136,14 @@ fn main() -> anyhow::Result<()> {
             println!("\n========== VibeStats 全量重建完成 ==========");
             for stat in &result {
                 println!(
-                    "[{}] {} - 输入: {}, 输出: {}, 缓存: {}, 花费: ${:.4}",
+                    "[{}] {} - 输入: {}, 输出: {}, 缓存: {}, 花费: ¥{:.4}",
                     stat.tool_name, stat.date,
                     stat.total_input_tokens, stat.total_output_tokens,
                     stat.total_cache_read_tokens, stat.estimated_cost
                 );
             }
             let total_cost: f64 = result.iter().map(|s| s.estimated_cost).sum();
-            println!("\n总计: ${:.2}", total_cost);
+            println!("\n总计: ¥{:.2}", total_cost);
             println!("============================================\n");
         } else {
             println!("没有找到可统计的数据。");
@@ -161,7 +165,7 @@ fn main() -> anyhow::Result<()> {
             println!("\n========== VibeStats 统计结果 ==========");
             for stat in &result {
                 println!(
-                    "[{}] {} - 输入: {}, 输出: {}, 缓存: {}, 花费: ${:.4}, ≈ {} 行代码, ≈ {:.1} 次 Opus4",
+                    "[{}] {} - 输入: {}, 输出: {}, 缓存: {}, 花费: ¥{:.4}, ≈ {} 行代码, ≈ {:.1} 次 Opus4",
                     stat.tool_name,
                     stat.date,
                     stat.total_input_tokens,
@@ -176,7 +180,7 @@ fn main() -> anyhow::Result<()> {
             let total_lines: i64 = result.iter().map(|s| s.code_lines_equivalent).sum();
             let total_opus: f64 = result.iter().map(|s| s.opus4_equivalent).sum();
             println!(
-                "\n总计: ${:.2} / {} 行代码 / {:.1} 次 Opus4",
+                "\n总计: ¥{:.2} / {} 行代码 / {:.1} 次 Opus4",
                 total_cost, total_lines, total_opus
             );
             println!("========================================\n");
@@ -254,9 +258,15 @@ fn load_config(args: &Args) -> anyhow::Result<Config> {
         info!("从配置文件加载: {}", config_path.display());
         match Config::load_from_file(&config_path) {
             Ok(config) => Ok(config),
-            Err(_) => {
-                // 旧配置格式不兼容，用默认配置覆盖
-                info!("配置文件格式不兼容，使用默认配置重新生成");
+            Err(e) => {
+                // 配置不兼容：先把坏文件备份到 .bak 保留现场，再用默认配置重新生成
+                // （原先直接原地覆盖，会丢失可排查的原始配置）
+                warn!("配置文件不兼容 ({}), 备份后用默认配置重新生成", e);
+                let bak = config_path.with_file_name(format!(
+                    "{}.bak",
+                    config_path.file_name().and_then(|s| s.to_str()).unwrap_or("config")
+                ));
+                let _ = std::fs::rename(&config_path, &bak);
                 let config = Config::default();
                 config.save_to_file(&config_path)?;
                 Ok(config)
@@ -303,7 +313,7 @@ fn send_startup_notification(_config: &Config, storage: &Storage) {
     let message = crate::models::NotificationMessage {
         title: "VibeStats 昨日报告".to_string(),
         body: format!(
-            "先生，您昨天消耗了 {} tokens，相当于写了 {} 行代码，相当于写了 {:.1} 本书，花费约 ${:.2}",
+            "先生，您昨天消耗了 {} tokens，相当于写了 {} 行代码，相当于写了 {:.1} 本书，花费约 ¥{:.2}",
             format_tokens(total_tokens),
             total_code_lines,
             books,

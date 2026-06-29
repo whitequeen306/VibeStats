@@ -137,9 +137,9 @@ impl Scheduler {
         let mut parser = LogParser::new(&Config::data_dir());
         let events = parser.parse_all_logs(&tool_configs);
 
-        // 2. 存储原始事件
+        // 2. 存储原始事件（按工具日志格式写入：快照式按 (tool,date) 替换 / 增量式去重）
         if !events.is_empty() {
-            storage.insert_raw_events(&events)?;
+            storage.store_parsed(&events, &tool_configs)?;
         }
 
         // 3. 保存文件指针

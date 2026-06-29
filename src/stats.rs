@@ -38,25 +38,23 @@ impl StatsEngine {
             let total_cache: i64 = tool_events.iter().map(|e| e.cache_read_tokens).sum();
             let event_count = tool_events.len() as i64;
 
-            // 优先使用实际费用（如 DeepSeek GUI 的 costUsd），否则按模型定价估算
-            let total_actual_cost: f64 = tool_events.iter()
-                .filter_map(|e| e.actual_cost)
-                .sum();
-            let estimated_cost = if total_actual_cost > 0.0 {
-                total_actual_cost
-            } else {
-                // 按每个事件的模型分别计算费用再求和（不同模型定价不同）
-                tool_events.iter().map(|e| {
+            // 逐事件计费：有实际费用（如 DeepSeek GUI 的 costUsd）就用实际值，
+            // 否则按该事件模型定价估算。两者均为 USD，统一求和后折算人民币。
+            // 不再"有实际费用就只算实际费用"——那样会丢掉无 actual_cost 的事件。
+            let raw_cost: f64 = tool_events.iter()
+                .map(|e| e.actual_cost.unwrap_or_else(|| {
                     FunMetrics::estimate_cost(
                         e.input_tokens,
                         e.output_tokens,
                         e.cache_read_tokens,
                         e.model_name.as_deref(),
                     )
-                }).sum()
-            };
-            let total_tokens = total_input + total_output + total_cache;
-            let code_lines = FunMetrics::tokens_to_code_lines(total_tokens);
+                }))
+                .sum();
+            // 统一折算为人民币：日志原始计费与按价估算均为 USD，按汇率换算
+            let estimated_cost = raw_cost * crate::models::get_usd_to_rmb();
+            // 代码行数只用输出 token 估算（输入/缓存是读进来的上下文，非生成代码）
+            let code_lines = FunMetrics::tokens_to_code_lines(total_output);
             let opus4_eq = FunMetrics::cost_to_opus4_equivalent(estimated_cost);
 
             let stats = DailyStats {
@@ -93,6 +91,18 @@ impl StatsEngine {
         }
 
         Ok(all_stats)
+    }
+
+    /// 重新聚合所有有原始事件的日期（改价后重算费用）
+    pub fn recompute_all(storage: &Storage) -> anyhow::Result<usize> {
+        let dates = storage.get_all_raw_event_dates()?;
+        let mut count = 0;
+        for date in dates {
+            Self::aggregate_daily(storage, &date)?;
+            count += 1;
+        }
+        info!("重新聚合完成，共 {} 个日期", count);
+        Ok(count)
     }
 
     /// 查找未聚合的日期
@@ -194,5 +204,100 @@ impl StatsEngine {
                 total_events: total_events,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_storage() -> (Storage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = Storage::open(&db_path).unwrap();
+        (storage, dir)
+    }
+
+    #[test]
+    fn test_recompute_all() {
+        let (storage, _dir) = create_test_storage();
+        let events = vec![
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-08T10:00:00".to_string(),
+                input_tokens: 1000, output_tokens: 500, cache_read_tokens: 300,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("test".to_string()),
+            },
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-09T11:00:00".to_string(),
+                input_tokens: 2000, output_tokens: 1000, cache_read_tokens: 600,
+                model_name: Some("claude-sonnet-4".to_string()),
+                actual_cost: None, raw_line: Some("test2".to_string()),
+            },
+        ];
+        storage.insert_raw_events(&events).unwrap();
+
+        // 先手动聚合 06-08，06-09 尚未聚合
+        let first = StatsEngine::aggregate_daily(&storage,
+            &NaiveDate::parse_from_str("2026-06-08", "%Y-%m-%d").unwrap()).unwrap();
+        let cost_0608 = first[0].estimated_cost;
+        assert!(cost_0608 > 0.0, "claude-sonnet-4 应有非零估算费用");
+        assert!(!storage.has_daily_stats(
+            &NaiveDate::parse_from_str("2026-06-09", "%Y-%m-%d").unwrap(),
+            "claude_code"));
+
+        // recompute_all 应聚合所有有原始事件的日期
+        let count = StatsEngine::recompute_all(&storage).unwrap();
+        assert_eq!(count, 2, "应聚合 2 个日期");
+
+        // 06-09 现在应有统计；06-08 重算后费用应保持一致（幂等）
+        assert!(storage.has_daily_stats(
+            &NaiveDate::parse_from_str("2026-06-09", "%Y-%m-%d").unwrap(),
+            "claude_code"));
+        let recomputed = StatsEngine::aggregate_daily(&storage,
+            &NaiveDate::parse_from_str("2026-06-08", "%Y-%m-%d").unwrap()).unwrap();
+        assert!((recomputed[0].estimated_cost - cost_0608).abs() < 1e-9,
+            "重算后 06-08 费用应与首次一致");
+    }
+
+    #[test]
+    fn test_recompute_reflects_price_change() {
+        // 串行化所有触碰全局覆盖表的测试，避免 set_pricing_overrides 互相覆盖
+        let _guard = crate::models::PRICING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (storage, _dir) = create_test_storage();
+        // price-test-model 不匹配任何硬编码分支 → 兜底价 2.5/10/1.25；1M input → ¥18.0（$2.5 × 汇率）
+        let events = vec![
+            RawEvent {
+                id: None, tool_name: "claude_code".to_string(),
+                timestamp: "2026-06-08T10:00:00".to_string(),
+                input_tokens: 1_000_000, output_tokens: 0, cache_read_tokens: 0,
+                model_name: Some("price-test-model".to_string()),
+                actual_cost: None, raw_line: Some("test".to_string()),
+            },
+        ];
+        storage.insert_raw_events(&events).unwrap();
+
+        let date = NaiveDate::parse_from_str("2026-06-08", "%Y-%m-%d").unwrap();
+        let cost_default = StatsEngine::aggregate_daily(&storage, &date).unwrap()[0].estimated_cost;
+        assert!((cost_default - 2.5 * crate::models::DEFAULT_USD_TO_RMB).abs() < 1e-9, "默认兜底价下 1M input 应为 ¥{:.2}", 2.5 * crate::models::DEFAULT_USD_TO_RMB);
+
+        // 设覆盖价 100/0/0，recompute_all 应反映新价 → ¥720（$100 × 汇率）
+        crate::models::set_pricing_overrides(std::collections::HashMap::from([(
+            "price-test-model".to_string(),
+            crate::models::ModelPricing {
+                input_per_mtok: 100.0, output_per_mtok: 0.0, cache_read_per_mtok: 0.0,
+            },
+        )]));
+        StatsEngine::recompute_all(&storage).unwrap();
+        let cost_new = StatsEngine::aggregate_daily(&storage, &date).unwrap()[0].estimated_cost;
+        assert!(cost_new > cost_default, "改价后费用应增大");
+        assert!((cost_new - 100.0 * crate::models::DEFAULT_USD_TO_RMB).abs() < 1e-9, "覆盖价 100/0/0 下 1M input 应为 ¥{:.2}", 100.0 * crate::models::DEFAULT_USD_TO_RMB);
+
+        // 清理全局表，避免污染其他测试
+        crate::models::clear_pricing_overrides();
     }
 }

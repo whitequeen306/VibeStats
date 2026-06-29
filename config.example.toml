@@ -9,7 +9,7 @@
 # 启用的工具 ID 列表（从内置注册表中选择）
 # 可选值：
 #   AI IDE:       cursor, trae, windsurf
-#   AI CLI:       claude_code, opencoder, aider, codex_cli, goose
+#   AI CLI:       claude_code, opencoder, aider, codex_cli, goose, zcode
 #   VS Code 扩展: github_copilot, cline, roo_code, continue_dev,
 #                 augment, supermaven, cody, tabnine
 #   JetBrains:    copilot_jetbrains, codeium_jetbrains
@@ -39,3 +39,16 @@ db_path = "vibestats.db"
 
 # HTTP 服务端口
 serve_port = 7890
+
+# 美元→人民币汇率（1 USD = ? CNY），可在 /settings 页面修改并触发历史费用重算
+exchange_rate = 7.2
+
+# ============================================================
+# 模型定价覆盖（可选）：key=模型名(小写)，value=每百万 Token 价格(美元)
+# 覆盖内置硬编码定价；改完需 vibestats.exe --rebuild 重新计算已存日期的费用
+# 字段：input / output / cache_read（均为 $/MTok）
+# key 用模型名小写全名精确匹配（如 glm-5.2），不做模糊匹配
+# 示例（均为官方 $/MTok 价）：
+# [pricing_overrides]
+# "glm-5.2" = { input = 0.6, output = 2.2, cache_read = 0.11 }
+# "claude-sonnet-4" = { input = 3.0, output = 15.0, cache_read = 0.30 }
