@@ -772,6 +772,46 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             text-transform: uppercase;
         }}
 
+        /* 各 Agent 用量明细表 */
+        .agent-detail {{
+            background: var(--gradient-card);
+            border-radius: var(--radius-md); padding: 20px 24px;
+            border: 1px solid var(--border-subtle); margin-bottom: 24px;
+        }}
+        .agent-detail h3 {{
+            margin-bottom: 14px; color: var(--text-secondary);
+            font-size: 0.92em; font-weight: 600; letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }}
+        .table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+        .agent-table {{
+            width: 100%; border-collapse: collapse; font-size: 0.88em; min-width: 760px;
+        }}
+        .agent-table th, .agent-table td {{
+            padding: 10px 12px; text-align: left;
+            border-bottom: 1px solid var(--border-subtle);
+        }}
+        .agent-table th {{
+            color: var(--text-muted); font-weight: 600; font-size: 0.8em;
+            text-transform: uppercase; letter-spacing: 0.4px;
+            background: var(--overlay-faint); white-space: nowrap;
+        }}
+        .agent-table td.num, .agent-table th.num {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
+        .agent-table td.cost {{ color: var(--accent-pink); font-weight: 600; }}
+        .agent-table tbody tr:hover {{ background: var(--overlay-faint); }}
+        .agent-table .agent-name {{ font-weight: 600; color: var(--text-primary); white-space: nowrap; }}
+        .agent-table .dot {{
+            display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+            margin-right: 8px; vertical-align: middle;
+        }}
+        .agent-table tr.total-row {{
+            font-weight: 700; border-top: 2px solid var(--border-medium);
+            background: var(--overlay-soft);
+        }}
+        .agent-table tr.total-row td {{ border-bottom: none; }}
+        .agent-table td.empty {{ text-align: center; color: var(--text-muted); padding: 24px; }}
+        @media (max-width: 600px) {{ .agent-detail {{ padding: 16px; }} .agent-table {{ font-size: 0.8em; }} }}
+
         /* 趣味换算 */
         .fun-metrics {{
             background: var(--gradient-card);
@@ -929,6 +969,28 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                 </div>
             </div>
 
+            <div class="agent-detail">
+                <h3>各 Agent 用量明细</h3>
+                <div class="table-wrap">
+                    <table class="agent-table" id="agentTable">
+                        <thead>
+                            <tr>
+                                <th>Agent</th>
+                                <th class="num">输入 Token</th>
+                                <th class="num">输出 Token</th>
+                                <th class="num">缓存命中</th>
+                                <th class="num">费用</th>
+                                <th class="num">代码行数</th>
+                                <th class="num">调用次数</th>
+                                <th class="num">费用占比</th>
+                            </tr>
+                        </thead>
+                        <tbody id="agentTableBody"></tbody>
+                        <tfoot id="agentTableFoot"></tfoot>
+                    </table>
+                </div>
+            </div>
+
             <div class="charts-row">
                 <div class="chart-box">
                     <h3>各 Agent 消耗对比</h3>
@@ -1013,6 +1075,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             loadCacheStats();
             renderFunMetrics();
             renderDailyReport();
+            renderAgentDetail();
             loadBuiltinTools();
             loadAvailableDates();
             // 自动轮询：间隔读 localStorage（默认 60s，0=关闭）；设置页改动经 storage 事件即时重建
@@ -1151,6 +1214,64 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                 }}]
             }});
             window.addEventListener('resize', () => chart.resize());
+        }}
+
+        // 各 Agent 用量明细表：按工具聚合 daily_data，列示输入/输出/缓存/费用/行数/调用次数/占比
+        function renderAgentDetail() {{
+            var tbody = document.getElementById('agentTableBody');
+            var tfoot = document.getElementById('agentTableFoot');
+            if (!tbody) return;
+            var rows = rawData.by_tool.map(function(t) {{
+                var d = t.daily_data;
+                return {{
+                    name: t.tool_name,
+                    input: d.reduce(function(s, x) {{ return s + x.input_tokens; }}, 0),
+                    output: d.reduce(function(s, x) {{ return s + x.output_tokens; }}, 0),
+                    cache: d.reduce(function(s, x) {{ return s + x.cache_read_tokens; }}, 0),
+                    cost: d.reduce(function(s, x) {{ return s + x.estimated_cost; }}, 0),
+                    lines: d.reduce(function(s, x) {{ return s + x.code_lines_equivalent; }}, 0),
+                    events: d.reduce(function(s, x) {{ return s + x.event_count; }}, 0),
+                    color: getToolColor(t.tool_name)
+                }};
+            }}).sort(function(a, b) {{ return b.cost - a.cost; }});
+            var totalCost = rows.reduce(function(s, r) {{ return s + r.cost; }}, 0);
+            if (rows.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+                tfoot.innerHTML = '';
+                return;
+            }}
+            var fmtInt = function(v) {{ return v.toLocaleString(); }};
+            var fmtCost = function(v) {{ return '¥' + v.toFixed(2); }};
+            var html = '';
+            rows.forEach(function(r) {{
+                var pct = totalCost > 0 ? (r.cost / totalCost * 100).toFixed(1) : '0.0';
+                html += '<tr>' +
+                    '<td class="agent-name"><span class="dot" style="background:' + r.color + '"></span>' + r.name + '</td>' +
+                    '<td class="num">' + fmtInt(r.input) + '</td>' +
+                    '<td class="num">' + fmtInt(r.output) + '</td>' +
+                    '<td class="num">' + fmtInt(r.cache) + '</td>' +
+                    '<td class="num cost">' + fmtCost(r.cost) + '</td>' +
+                    '<td class="num">' + fmtInt(r.lines) + '</td>' +
+                    '<td class="num">' + fmtInt(r.events) + '</td>' +
+                    '<td class="num">' + pct + '%</td>' +
+                    '</tr>';
+            }});
+            tbody.innerHTML = html;
+            var ti = rows.reduce(function(s, r) {{ return s + r.input; }}, 0);
+            var to = rows.reduce(function(s, r) {{ return s + r.output; }}, 0);
+            var tc = rows.reduce(function(s, r) {{ return s + r.cache; }}, 0);
+            var tl = rows.reduce(function(s, r) {{ return s + r.lines; }}, 0);
+            var te = rows.reduce(function(s, r) {{ return s + r.events; }}, 0);
+            tfoot.innerHTML = '<tr class="total-row">' +
+                '<td>合计</td>' +
+                '<td class="num">' + fmtInt(ti) + '</td>' +
+                '<td class="num">' + fmtInt(to) + '</td>' +
+                '<td class="num">' + fmtInt(tc) + '</td>' +
+                '<td class="num cost">' + fmtCost(totalCost) + '</td>' +
+                '<td class="num">' + fmtInt(tl) + '</td>' +
+                '<td class="num">' + fmtInt(te) + '</td>' +
+                '<td class="num">100.0%</td>' +
+                '</tr>';
         }}
 
         let trendChartInstance = null;
@@ -1512,6 +1633,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                     renderPieChart();
                     renderFunMetrics();
                     renderDailyReport();
+                    renderAgentDetail();
                 }});
             loadTrendData(currentTrendRange);
             fetchCacheStats(start, end);
