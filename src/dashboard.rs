@@ -495,8 +495,6 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VibeStats - VibeCoding 趣味仪表盘</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script>(function(){{var t=localStorage.getItem('vibestats-theme')||'light';document.documentElement.dataset.theme=t;}})();</script>
     <style>
         :root {{
@@ -554,7 +552,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 
         body {{
-            font-family: 'Outfit', 'Noto Sans SC', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
             background: var(--bg-deep);
             color: var(--text-primary);
             min-height: 100vh;
@@ -600,7 +598,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             50% {{ opacity: 0.4; transform: scale(0.7); }}
         }}
         .header h1 {{
-            font-family: 'Space Grotesk', 'Outfit', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
             font-size: 3.2em; font-weight: 700; letter-spacing: -1.5px;
             background: var(--gradient-hero);
             -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
@@ -734,7 +732,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
         }}
         .card .value {{
             font-size: 2em; font-weight: 700; letter-spacing: -0.5px;
-            font-family: 'Space Grotesk', 'Outfit', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
         }}
         .card .sub {{
             font-size: 0.78em; color: var(--text-muted); margin-top: 6px;
@@ -841,7 +839,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
         }}
         .fun-item .fun-value {{
             font-size: 1.3em; font-weight: 700; color: var(--accent-cyan);
-            margin-top: 6px; font-family: 'Outfit', sans-serif;
+            margin-top: 6px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
         }}
         .fun-item .fun-desc {{
             color: var(--text-muted); font-size: 0.76em; margin-top: 4px;
