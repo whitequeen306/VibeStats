@@ -272,6 +272,10 @@ fn default_exchange_rate() -> f64 {
     7.2
 }
 
+fn default_refresh_interval() -> u64 {
+    30
+}
+
 /// VibeStats 全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -291,6 +295,10 @@ pub struct Config {
     /// 美元→人民币汇率（1 USD = ? CNY），可在设置页修改并触发历史费用重算
     #[serde(default = "default_exchange_rate")]
     pub exchange_rate: f64,
+    /// 实时刷新间隔（秒）：后台每隔该时长重新解析日志并重算统计，使仪表盘近实时
+    /// 默认 30 秒。设为 0 则禁用实时刷新（仅靠每日定时任务）。
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -312,6 +320,7 @@ impl Default for Config {
             serve_port: 7890,
             pricing_overrides: std::collections::HashMap::new(),
             exchange_rate: 7.2,
+            refresh_interval_secs: 30,
         }
     }
 }

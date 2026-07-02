@@ -613,6 +613,24 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             font-weight: 400; letter-spacing: 1px; text-transform: uppercase;
         }}
 
+        /* 实时刷新状态徽标 */
+        .live-status {{
+            margin: 10px 0 0; font-size: 0.8em; color: var(--text-muted);
+            display: flex; align-items: center; justify-content: center; gap: 7px;
+            letter-spacing: 0.5px;
+        }}
+        .live-status .live-dot {{
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #22c55e; box-shadow: 0 0 0 0 rgba(34,197,94,0.6);
+            animation: livePulse 1.8s infinite;
+        }}
+        @keyframes livePulse {{
+            0% {{ box-shadow: 0 0 0 0 rgba(34,197,94,0.6); }}
+            70% {{ box-shadow: 0 0 0 7px rgba(34,197,94,0); }}
+            100% {{ box-shadow: 0 0 0 0 rgba(34,197,94,0); }}
+        }}
+        #liveUpdated {{ color: var(--text-muted); opacity: 0.8; }}
+
         .container {{ max-width: 1400px; margin: 0 auto; padding: 0 24px 40px; }}
 
         /* ===== Controls ===== */
@@ -926,6 +944,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             <h1>VibeStats</h1>
             <p class="tagline">让每一次 Token 燃烧都有迹可循</p>
             <p class="date-label" id="dateLabel">昨日数据</p>
+            <p class="live-status"><span class="live-dot"></span><span id="liveText">实时刷新中</span><span id="liveUpdated"></span></p>
         </div>
 
         <div class="container">
@@ -1043,7 +1062,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             </div>
         </div>
 
-        <div class="footer">VibeStats v0.2 · 数据每日自动更新</div>
+        <div class="footer">VibeStats v0.2.1 · 数据每 30 秒自动刷新</div>
     </div>
 
     <script>
@@ -1076,8 +1095,9 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             renderAgentDetail();
             loadBuiltinTools();
             loadAvailableDates();
-            // 自动轮询：间隔读 localStorage（默认 60s，0=关闭）；设置页改动经 storage 事件即时重建
-            var pollInterval = parseInt(localStorage.getItem('vibestats-poll-interval')) || 60;
+            markUpdated();
+            // 自动轮询：间隔读 localStorage（默认 30s，0=关闭）；设置页改动经 storage 事件即时重建
+            var pollInterval = parseInt(localStorage.getItem('vibestats-poll-interval')) || 30;
             var pollTimer = null;
             function startPolling() {{
                 if (pollTimer) clearInterval(pollTimer);
@@ -1087,7 +1107,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             // 跨标签同步：设置页改主题/轮询间隔时，本页即时响应
             window.addEventListener('storage', function(e) {{
                 if (e.key === 'vibestats-poll-interval') {{
-                    pollInterval = parseInt(e.newValue) || 60; startPolling();
+                    pollInterval = parseInt(e.newValue) || 30; startPolling();
                 }} else if (e.key === 'vibestats-theme') {{
                     document.documentElement.dataset.theme = e.newValue || 'light';
                     applyThemeIcon(); renderBarChart(); renderPieChart(); renderFunMetrics();
@@ -1102,6 +1122,16 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             document.getElementById('totalLines').textContent = t.total_code_lines.toLocaleString();
             document.getElementById('totalBooks').textContent = Math.max(1, Math.floor(t.total_code_lines / 30000)).toLocaleString() + ' 本';
             document.getElementById('totalEvents').textContent = t.total_events.toLocaleString();
+        }}
+
+        // 更新"最后更新"时间戳，供实时刷新可见反馈
+        function markUpdated() {{
+            var el = document.getElementById('liveUpdated');
+            if (el) {{
+                var d = new Date();
+                var pad = function(n) {{ return n < 10 ? '0'+n : ''+n; }};
+                el.textContent = ' · 最后更新 ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+            }}
         }}
 
         function formatTokens(n) {{
@@ -1632,6 +1662,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
                     renderFunMetrics();
                     renderDailyReport();
                     renderAgentDetail();
+                    markUpdated();
                 }});
             loadTrendData(currentTrendRange);
             fetchCacheStats(start, end);
@@ -2014,14 +2045,14 @@ function initDisplayPrefs(){
     r.addEventListener('change', function(){ if(r.checked) applyTheme(r.value); });
   });
   var pi = parseInt(localStorage.getItem('vibestats-poll-interval'));
-  if(isNaN(pi)){ pi = 60; }
+  if(isNaN(pi)){ pi = 30; }
   var off = document.getElementById('pollOff');
   var inp = document.getElementById('pollInterval');
-  if(pi <= 0){ off.checked = true; inp.value = 60; inp.disabled = true; }
+  if(pi <= 0){ off.checked = true; inp.value = 30; inp.disabled = true; }
   else { off.checked = false; inp.value = pi; inp.disabled = false; }
   off.addEventListener('change', function(){
     if(off.checked){ localStorage.setItem('vibestats-poll-interval','0'); inp.disabled = true; }
-    else { var v = parseInt(inp.value)||60; if(v<10){ v=10; inp.value=10; } localStorage.setItem('vibestats-poll-interval', String(v)); inp.disabled=false; }
+    else { var v = parseInt(inp.value)||30; if(v<10){ v=10; inp.value=10; } localStorage.setItem('vibestats-poll-interval', String(v)); inp.disabled=false; }
   });
   inp.addEventListener('change', function(){
     var v = parseInt(inp.value); if(isNaN(v)||v<10){ v=10; inp.value=10; }
