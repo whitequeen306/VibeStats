@@ -1045,7 +1045,7 @@ fn render_dashboard_html(stats: &AggregatedStats) -> anyhow::Result<String> {
             </div>
         </div>
 
-        <div class="footer">VibeStats v0.2 · 数据每日自动更新</div>
+        <div class="footer">VibeStats v0.2.1 · 数据每日自动更新</div>
     </div>
 
     <script>

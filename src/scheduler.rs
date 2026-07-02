@@ -146,7 +146,17 @@ impl Scheduler {
         parser.save_pointers();
 
         // 4. 聚合统计
-        let stats = StatsEngine::aggregate_daily(storage, &date)?;
+        //    快照式解析器（ZCodeSqlite/CodexJsonl/TraeCnLog 等）每次重读全量源数据、
+        //    按 (tool,date) 替换 raw_events，这会使“已有 daily_stats 的日期”的
+        //    raw_events 在源库后续增长后变大（同一天仍在持续使用、或今天的实时数据）。
+        //    若只聚合传入的单个 date，其它已增长日期的 daily_stats 会一直停留在
+        //    上次聚合时的旧值 → 与 raw_events 不一致 → 统计偏低。
+        //    故此处改为 recompute_all：对所有有 raw_events 的日期全部重算，
+        //    保证 daily_stats 始终与 raw_events 一致。增量式解析器同理幂等。
+        StatsEngine::recompute_all(storage)?;
+
+        // 5. 取回当天统计（供晨报通知使用）
+        let stats = storage.get_daily_stats_range(&date, &date)?;
 
         info!("{} 统计完成，共 {} 条统计记录", date, stats.len());
         Ok(stats)
