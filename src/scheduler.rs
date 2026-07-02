@@ -9,6 +9,7 @@ use crate::stats::StatsEngine;
 use crate::storage::Storage;
 
 /// T+1 定时调度器
+#[derive(Clone)]
 pub struct Scheduler {
     config: Config,
     db_path: PathBuf,
@@ -31,6 +32,22 @@ impl Scheduler {
         {
             let storage = self.open_storage()?;
             self.check_and_compensate(&storage)?;
+        }
+
+        // 1.5 启动实时刷新循环（每 refresh_interval_secs 秒重新解析+重算）
+        //    与每日晨报循环共享同一 current_thread runtime：单线程协作调度，
+        //    两者均在 await 之间同步完成 DB 写入，不会并发写同一连接。
+        //    clone 出独立 Scheduler 实例（各自 open_storage 开独立连接），
+        //    使 spawned task 满足 'static 约束。
+        let interval = self.config.refresh_interval_secs;
+        if interval > 0 {
+            let refresh_sched = self.clone();
+            tokio::spawn(async move {
+                refresh_sched.refresh_loop().await;
+            });
+            info!("实时刷新已启动，每 {} 秒采集一次用量", interval);
+        } else {
+            info!("实时刷新已禁用 (refresh_interval_secs=0)，仅靠每日定时任务");
         }
 
         // 2. 解析调度时间
@@ -172,5 +189,36 @@ impl Scheduler {
 
         // 再统计今天
         self.run_daily_stats(storage, today)
+    }
+
+    /// 单次实时刷新：重新解析全部启用工具的日志、按 (tool,date) 替换 raw_events、
+    /// 重算所有日期的 daily_stats。不发送通知。失败不抛、由调用方记录。
+    /// 与 run_daily_stats 的区别：不取回/返回某日统计、不发晨报，纯数据刷新。
+    fn refresh_once(&self) -> anyhow::Result<()> {
+        let storage = self.open_storage()?;
+        let tool_configs = self.config.enabled_tools();
+        let mut parser = LogParser::new(&Config::data_dir());
+        let events = parser.parse_all_logs(&tool_configs);
+        if !events.is_empty() {
+            storage.store_parsed(&events, &tool_configs)?;
+        }
+        parser.save_pointers();
+        StatsEngine::recompute_all(&storage)?;
+        Ok(())
+    }
+
+    /// 实时刷新循环：每 refresh_interval_secs 秒采集一次，使仪表盘近实时反映用量。
+    pub async fn refresh_loop(&self) {
+        let interval = self.config.refresh_interval_secs;
+        if interval == 0 {
+            return;
+        }
+        let duration = tokio::time::Duration::from_secs(interval);
+        loop {
+            if let Err(e) = self.refresh_once() {
+                warn!("实时刷新失败: {}", e);
+            }
+            tokio::time::sleep(duration).await;
+        }
     }
 }
